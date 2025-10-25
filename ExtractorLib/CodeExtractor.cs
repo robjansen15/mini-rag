@@ -480,6 +480,8 @@ public sealed class CodeExtractor
         var rel = Path.GetRelativePath(root, file);
         var abs = Path.GetFullPath(file);
         var contentWithCtx = DocumentBuilder.BuildTextWithContext(root, rel, abs, lang, text.Value.Content);
+        var pathTokens = ExtractPathTokens(rel);
+        var dependencies = ExtractDependencies(text.Value.Content, lang);
 
         var fileObj = new JsonObj
         {
@@ -492,7 +494,9 @@ public sealed class CodeExtractor
             lang = lang,
             size = text.Value.Size,
             hash = ExtractionTools.Sha256(text.Value.Content),
-            text = contentWithCtx
+            text = contentWithCtx,
+            path_tokens = pathTokens,
+            dependencies = dependencies
         };
         yield return JsonSerializer.Serialize(fileObj);
 
@@ -511,7 +515,9 @@ public sealed class CodeExtractor
                 lang = lang,
                 size = cls.body.Length,
                 hash = ExtractionTools.Sha256(cls.body),
-                text = DocumentBuilder.BuildTextWithContext(root, rel, abs, lang, cls.body)
+                text = DocumentBuilder.BuildTextWithContext(root, rel, abs, lang, cls.body),
+                path_tokens = pathTokens,
+                dependencies = dependencies
             };
             yield return JsonSerializer.Serialize(clsObj);
         }
@@ -531,7 +537,9 @@ public sealed class CodeExtractor
                 lang = lang,
                 size = fn.body.Length,
                 hash = ExtractionTools.Sha256(fn.body),
-                text = DocumentBuilder.BuildTextWithContext(root, rel, abs, lang, fn.body)
+                text = DocumentBuilder.BuildTextWithContext(root, rel, abs, lang, fn.body),
+                path_tokens = pathTokens,
+                dependencies = dependencies
             };
             yield return JsonSerializer.Serialize(fnObj);
         }
@@ -551,5 +559,97 @@ public sealed class CodeExtractor
         public int size { get; set; }
         public string hash { get; set; } = "";
         public string text { get; set; } = "";
+        public string[]? path_tokens { get; set; }
+        public string[]? dependencies { get; set; }
+    }
+
+    static string[] ExtractPathTokens(string relativePath)
+    {
+        var normalized = relativePath.Replace('\\', '/');
+        var rawTokens = normalized
+            .Split(new[] { '/', '-', '_', '.', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var tokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in rawTokens)
+        {
+            if (raw.Length == 0) continue;
+            tokens.Add(raw.ToLowerInvariant());
+        }
+        return tokens.Take(24).ToArray();
+    }
+
+    static string[] ExtractDependencies(string content, string lang)
+    {
+        var deps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using var reader = new StringReader(content);
+        string? line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0) continue;
+            if (trimmed.StartsWith("//", StringComparison.Ordinal) || trimmed.StartsWith("#", StringComparison.Ordinal))
+            {
+                if (trimmed.StartsWith("#include", StringComparison.OrdinalIgnoreCase))
+                {
+                    var include = trimmed.Substring(8).Trim().Trim('<', '>', '"');
+                    if (include.Length > 0) deps.Add(include);
+                }
+                continue;
+            }
+            if (trimmed.StartsWith("/*", StringComparison.Ordinal)) continue;
+
+            if (trimmed.StartsWith("using ", StringComparison.OrdinalIgnoreCase))
+            {
+                var stmt = trimmed.Substring(6).TrimEnd(';').Trim();
+                if (stmt.Length > 0) deps.Add(stmt);
+                continue;
+            }
+
+            if (trimmed.StartsWith("import ", StringComparison.OrdinalIgnoreCase))
+            {
+                var rest = trimmed.Substring(7).Trim();
+                if (rest.StartsWith("{"))
+                {
+                    var after = rest.Split(new[] { "from " }, StringSplitOptions.RemoveEmptyEntries);
+                    if (after.Length > 1)
+                    {
+                        var module = after[^1].Trim().Trim(';').Trim('"', '\'', '`');
+                        if (module.Length > 0) deps.Add(module);
+                    }
+                }
+                else
+                {
+                    var parts = rest.Split(new[] { " as ", ",", " from " }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length > 0)
+                    {
+                        var module = parts[^1].Trim().Trim(';').Trim('"', '\'', '`');
+                        if (module.Length > 0) deps.Add(module);
+                    }
+                }
+                continue;
+            }
+
+            if (trimmed.StartsWith("from ", StringComparison.OrdinalIgnoreCase) && trimmed.Contains(" import ", StringComparison.OrdinalIgnoreCase))
+            {
+                var module = trimmed.Substring(5, trimmed.IndexOf(" import ", StringComparison.OrdinalIgnoreCase) - 5)
+                    .Trim().Trim(';');
+                if (module.Length > 0) deps.Add(module);
+                continue;
+            }
+
+            if (trimmed.StartsWith("require(", StringComparison.OrdinalIgnoreCase))
+            {
+                var start = trimmed.IndexOf('(');
+                var end = trimmed.IndexOf(')');
+                if (start >= 0 && end > start)
+                {
+                    var module = trimmed[(start + 1)..end].Trim().Trim('"', '\'', '`');
+                    if (module.Length > 0) deps.Add(module);
+                }
+                continue;
+            }
+        }
+
+        if (deps.Count == 0) return Array.Empty<string>();
+        return deps.Take(24).ToArray();
     }
 }

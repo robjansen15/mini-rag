@@ -7,18 +7,20 @@ using System.Text.Json;
 
 namespace SemanticLib;
 
-public sealed record SemanticNodeSummary
-{
-    public required string Id { get; init; }
-    public required string Title { get; init; }
-    public required string Summary { get; init; }
-    public required string Classification { get; init; }
-    public required IReadOnlyList<string> Responsibilities { get; init; }
-    public required IReadOnlyList<string> Keywords { get; init; }
-    public required IReadOnlyList<string> Paths { get; init; }
+    public sealed record SemanticNodeSummary
+    {
+        public required string Id { get; init; }
+        public required string Title { get; init; }
+        public required string Summary { get; init; }
+        public required string Classification { get; init; }
+        public required IReadOnlyList<string> Responsibilities { get; init; }
+        public required IReadOnlyList<string> Keywords { get; init; }
+        public required IReadOnlyList<string> Paths { get; init; }
+        public IReadOnlyList<string> Dependencies { get; init; } = Array.Empty<string>();
+        public string SchemaVersion { get; init; } = SemanticSummaryBuilder.SummarySchemaVersion;
 
-    public bool IsBackend => string.Equals(Classification, "backend", StringComparison.OrdinalIgnoreCase);
-}
+        public bool IsBackend => string.Equals(Classification, "backend", StringComparison.OrdinalIgnoreCase);
+    }
 
 public sealed class SemanticSummaryStore
 {
@@ -108,7 +110,8 @@ public sealed class SemanticSummaryStore
             node.Summary,
             string.Join(' ', node.Responsibilities),
             string.Join(' ', node.Keywords),
-            string.Join(' ', node.Paths)
+            string.Join(' ', node.Paths),
+            string.Join(' ', node.Dependencies)
         });
 
         if (haystack.Length == 0) return 0f;
@@ -132,6 +135,17 @@ public sealed class SemanticSummaryStore
         else if (string.Equals(priority, "frontend", StringComparison.OrdinalIgnoreCase))
         {
             score *= node.IsBackend ? 0.7f : 1.3f;
+        }
+
+        if (node.Dependencies.Count > 0 && expansion.Subsystems.Count > 0)
+        {
+            foreach (var dep in node.Dependencies)
+            {
+                if (expansion.Subsystems.Contains(dep, StringComparer.OrdinalIgnoreCase))
+                {
+                    score += 2.5f;
+                }
+            }
         }
 
         return score;

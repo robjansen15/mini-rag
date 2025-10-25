@@ -129,6 +129,15 @@ static class ChatCommand
             filtered.Add(prioritized[0]);
         }
 
+        if (filtered.Count < config.RetrievalTopK)
+        {
+            foreach (var extra in prioritized)
+            {
+                if (filtered.Count >= config.RetrievalTopK) break;
+                if (!filtered.Contains(extra)) filtered.Add(extra);
+            }
+        }
+
         if (filtered.Count == 0)
         {
             Console.WriteLine("  No relevant documents found in the corpus.");
@@ -236,6 +245,10 @@ static class ChatCommand
             if (node.Keywords.Count > 0)
             {
                 sb.AppendLine("Keywords: " + string.Join(", ", node.Keywords));
+            }
+            if (node.Dependencies.Count > 0)
+            {
+                sb.AppendLine("Dependencies: " + string.Join(", ", node.Dependencies));
             }
             if (i < nodes.Count - 1)
             {

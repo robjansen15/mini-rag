@@ -12,6 +12,8 @@ namespace SemanticLib;
 
 public sealed class SemanticSummaryBuilder
 {
+    public const string SummarySchemaVersion = "2";
+
     readonly string _corpusPath;
     readonly string _summaryPath;
     readonly SemanticSummaryBuilderOptions _opts;
@@ -36,7 +38,7 @@ public sealed class SemanticSummaryBuilder
         if (!corpusInfo.Exists) throw new FileNotFoundException("Corpus not found", _corpusPath);
 
         var summaryInfo = new FileInfo(_summaryPath);
-        if (summaryInfo.Exists && summaryInfo.LastWriteTimeUtc >= corpusInfo.LastWriteTimeUtc)
+        if (summaryInfo.Exists && summaryInfo.LastWriteTimeUtc >= corpusInfo.LastWriteTimeUtc && HasMatchingSchemaVersion(_summaryPath))
         {
             return SemanticSummaryStore.Load(_summaryPath);
         }
@@ -54,6 +56,21 @@ public sealed class SemanticSummaryBuilder
         }
 
         return new SemanticSummaryStore(nodes);
+    }
+
+    static bool HasMatchingSchemaVersion(string path)
+    {
+        try
+        {
+            using var reader = new StreamReader(path);
+            var firstLine = reader.ReadLine();
+            if (string.IsNullOrWhiteSpace(firstLine)) return false;
+            return firstLine.Contains("\"SchemaVersion\":\"" + SummarySchemaVersion + "\"", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     async Task<IReadOnlyList<SemanticNodeSummary>> BuildAsync(OllamaChatClient client, CancellationToken ct)
@@ -115,6 +132,13 @@ public sealed class SemanticSummaryBuilder
 
                 builder.Paths.Add(path);
                 builder.IsBackend |= IsBackendPath(path);
+                if (root.TryGetProperty("dependencies", out var depEl))
+                {
+                    foreach (var dep in ReadStringArray(depEl))
+                    {
+                        builder.Dependencies.Add(dep);
+                    }
+                }
                 builder.AppendSample(text, _opts.MaxSampleChars);
             }
             catch
@@ -185,6 +209,9 @@ public sealed class SemanticSummaryBuilder
             var classification = root.TryGetProperty("classification", out var cEl) && cEl.ValueKind == JsonValueKind.String
                 ? NormaliseClassification(cEl.GetString())
                 : seed.IsBackend ? "backend" : "shared";
+            var dependencies = root.TryGetProperty("dependencies", out var dEl)
+                ? ReadStringArray(dEl)
+                : seed.Dependencies ?? Array.Empty<string>();
 
             return new SemanticNodeSummary
             {
@@ -194,7 +221,9 @@ public sealed class SemanticSummaryBuilder
                 Responsibilities = responsibilities,
                 Keywords = keywords,
                 Classification = classification,
-                Paths = seed.Paths.ToArray()
+                Paths = seed.Paths.ToArray(),
+                Dependencies = dependencies,
+                SchemaVersion = SummarySchemaVersion
             };
         }
         catch
@@ -207,7 +236,9 @@ public sealed class SemanticSummaryBuilder
                 Responsibilities = seed.FallbackResponsibilities,
                 Keywords = seed.FallbackKeywords,
                 Classification = seed.IsBackend ? "backend" : "shared",
-                Paths = seed.Paths.ToArray()
+                Paths = seed.Paths.ToArray(),
+                Dependencies = seed.Dependencies ?? Array.Empty<string>(),
+                SchemaVersion = SummarySchemaVersion
             };
         }
     }
@@ -221,10 +252,16 @@ public sealed class SemanticSummaryBuilder
         {
             sb.AppendLine("- " + path);
         }
+        if (seed.Dependencies is { Count: > 0 })
+        {
+            sb.AppendLine();
+            sb.AppendLine("Observed dependencies: " + string.Join(", ", seed.Dependencies.Take(12)));
+        }
         sb.AppendLine();
         sb.AppendLine("Source excerpts:\n```\n" + seed.Sample.ToString().Trim() + "\n```");
         sb.AppendLine();
         sb.AppendLine("Return JSON with keys: title, summary, responsibilities (array), keywords (array), classification (backend|frontend|shared).");
+        sb.AppendLine("Include a 'dependencies' array of external systems or modules mentioned above (if any).");
         sb.AppendLine("Summaries must highlight data flow, dependencies, and main responsibilities. Prefer backend classification when unsure.");
         return sb.ToString();
     }
@@ -284,6 +321,7 @@ public sealed class SemanticSummaryBuilder
         public List<string> Paths { get; } = new();
         public bool IsBackend { get; set; }
         public StringBuilder Sample { get; } = new();
+        public HashSet<string> Dependencies { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public void AppendSample(string text, int maxChars)
         {
@@ -306,11 +344,17 @@ public sealed class SemanticSummaryBuilder
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Take(8)
                 .ToList();
-            return new SummarySeed(Id, cleanedPaths, Sample, IsBackend);
+            var deps = Dependencies
+                .Where(d => !string.IsNullOrWhiteSpace(d))
+                .Select(d => d.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(16)
+                .ToList();
+            return new SummarySeed(Id, cleanedPaths, Sample, IsBackend, deps);
         }
     }
 
-    sealed record SummarySeed(string Id, List<string> Paths, StringBuilder Sample, bool IsBackend)
+    sealed record SummarySeed(string Id, List<string> Paths, StringBuilder Sample, bool IsBackend, IReadOnlyList<string> Dependencies)
     {
         public string FallbackSummary =>
             $"Module {Id} contains {Paths.Count} file(s) with focus on {(IsBackend ? "backend" : "shared")} responsibilities.";
@@ -329,6 +373,7 @@ public sealed class SemanticSummaryBuilder
                 .Where(name => !string.IsNullOrWhiteSpace(name))
                 .Take(5)
                 .ToArray();
+
     }
 }
 

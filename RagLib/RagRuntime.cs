@@ -248,13 +248,34 @@ public sealed class RagRuntime : IAsyncDisposable
 
     static IEnumerable<string> Tokenize(string text)
     {
+        if (string.IsNullOrEmpty(text)) yield break;
+
         var sb = new StringBuilder();
         foreach (var ch in text)
         {
-            if (char.IsLetterOrDigit(ch)) sb.Append(char.ToLowerInvariant(ch));
-            else { if (sb.Length > 0) { yield return sb.ToString(); sb.Clear(); } }
+            if (char.IsLetterOrDigit(ch))
+            {
+                if (sb.Length > 0 && char.IsUpper(ch) && char.IsLower(sb[^1]))
+                {
+                    yield return sb.ToString();
+                    sb.Clear();
+                }
+                sb.Append(char.ToLowerInvariant(ch));
+            }
+            else
+            {
+                if (sb.Length > 0)
+                {
+                    yield return sb.ToString();
+                    sb.Clear();
+                }
+            }
         }
-        if (sb.Length > 0) yield return sb.ToString();
+
+        if (sb.Length > 0)
+        {
+            yield return sb.ToString();
+        }
     }
 
     public ValueTask DisposeAsync()
