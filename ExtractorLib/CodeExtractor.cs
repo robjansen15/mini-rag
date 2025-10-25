@@ -4,7 +4,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -27,6 +26,7 @@ public sealed class CodeExtractor
 {
     readonly ExtractOptions _opts;
     readonly int _scanThreads;
+    const string PartitionKeyRoot = "<root>";
 
     public CodeExtractor(ExtractOptions opts)
     {
@@ -100,6 +100,8 @@ public sealed class CodeExtractor
         long bytesToProcess = 0;
         
         Console.WriteLine("[extract] Calculating hashes to detect changes...");
+        var totalToHash = fileInfos.Count;
+        var hashedCount = 0;
         foreach (var (file, size) in fileInfos)
         {
             ct.ThrowIfCancellationRequested();
@@ -116,6 +118,16 @@ public sealed class CodeExtractor
                 filesToProcess.Add((file, size));
                 bytesToProcess += size;
             }
+
+            hashedCount++;
+            if (totalToHash >= 50 && (hashedCount % 50 == 0 || hashedCount == totalToHash))
+            {
+                Console.Write($"\r[extract] Hashed {hashedCount}/{totalToHash} files   ");
+            }
+        }
+        if (totalToHash >= 50)
+        {
+            Console.WriteLine();
         }
         
         Console.WriteLine($"[extract] Files unchanged: {skippedUnchanged}, files to process: {filesToProcess.Count}");
@@ -132,55 +144,66 @@ public sealed class CodeExtractor
         var processedCount = 0;
         long processedBytes = 0;
         var startTime = DateTimeOffset.UtcNow;
-        var i = 0;
 
-        while (i < filesToProcess.Count)
+        var partitions = filesToProcess
+            .GroupBy(item => PartitionKey(root, item.path))
+            .OrderBy(g => g.Key, StringComparer.Ordinal)
+            .ToList();
+
+        foreach (var group in partitions)
         {
-            ct.ThrowIfCancellationRequested();
-            var round = filesToProcess.Skip(i).Take(_scanThreads).ToList();
+            var displayName = group.Key == PartitionKeyRoot ? "(root)" : group.Key;
+            Console.WriteLine($"[extract] Processing folder {displayName} ({group.Count()} files)");
 
-            Parallel.ForEach(
-                source: round,
-                new ParallelOptions { MaxDegreeOfParallelism = _scanThreads, CancellationToken = ct },
-                item =>
-                {
-                    var (path, size) = item;
-                    try
-                    {
-                        var entryLines = ProcessFile(root, path).ToList();
-                        if (entryLines.Count > 0)
-                        {
-                            newEntries[path] = entryLines;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.Error.WriteLine($"Error processing {path}: {ex.Message}");
-                    }
-                });
-
-            // Update progress
-            foreach (var (path, size) in round)
+            var batch = group.ToList();
+            var localIndex = 0;
+            while (localIndex < batch.Count)
             {
-                processedBytes += size;
-            }
-            processedCount += round.Count;
-            
-            var percentage = (processedCount * 100.0) / filesToProcess.Count;
-            var elapsed = DateTimeOffset.UtcNow - startTime;
-            var bytesPerSecond = processedBytes / elapsed.TotalSeconds;
-            var remainingBytes = bytesToProcess - processedBytes;
-            var estimatedSecondsRemaining = remainingBytes / Math.Max(bytesPerSecond, 1);
-            var eta = TimeSpan.FromSeconds(estimatedSecondsRemaining);
-            
-            Console.Write($"\r[extract] Progress: {processedCount}/{filesToProcess.Count} files ({percentage:F1}%) | " +
-                         $"{FormatBytes(processedBytes)}/{FormatBytes(bytesToProcess)} | " +
-                         $"ETA: {FormatTimeSpan(eta)}      ");
+                ct.ThrowIfCancellationRequested();
+                var round = batch.Skip(localIndex).Take(_scanThreads).ToList();
 
-            i += round.Count;
+                Parallel.ForEach(
+                    source: round,
+                    new ParallelOptions { MaxDegreeOfParallelism = _scanThreads, CancellationToken = ct },
+                    item =>
+                    {
+                        var (path, size) = item;
+                        try
+                        {
+                            var entryLines = ProcessFile(root, path).ToList();
+                            if (entryLines.Count > 0)
+                            {
+                                newEntries[path] = entryLines;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"Error processing {path}: {ex.Message}");
+                        }
+                    });
+
+                foreach (var (path, size) in round)
+                {
+                    processedBytes += size;
+                }
+                processedCount += round.Count;
+
+                var percentage = (processedCount * 100.0) / filesToProcess.Count;
+                var elapsed = DateTimeOffset.UtcNow - startTime;
+                var bytesPerSecond = processedBytes / Math.Max(elapsed.TotalSeconds, 1);
+                var remainingBytes = bytesToProcess - processedBytes;
+                var estimatedSecondsRemaining = remainingBytes / Math.Max(bytesPerSecond, 1);
+                var eta = TimeSpan.FromSeconds(estimatedSecondsRemaining);
+
+                Console.Write($"\r[extract] Progress: {processedCount}/{filesToProcess.Count} files ({percentage:F1}%) | " +
+                             $"{FormatBytes(processedBytes)}/{FormatBytes(bytesToProcess)} | " +
+                             $"ETA: {FormatTimeSpan(eta)}      ");
+
+                localIndex += round.Count;
+            }
+
+            Console.WriteLine();
         }
-        
-        Console.WriteLine();
         
         // Merge: write tree, then existing (unchanged) entries, then new entries
         var finalPath = _opts.OutPath;
@@ -353,12 +376,23 @@ public sealed class CodeExtractor
     {
         try
         {
-            using var sha = SHA256.Create();
+            const ulong offsetBasis = 1469598103934665603;
+            const ulong prime = 1099511628211;
+            ulong hash = offsetBasis;
+
             using var fs = File.OpenRead(filePath);
-            var hash = sha.ComputeHash(fs);
-            var sb = new StringBuilder(hash.Length * 2);
-            foreach (var b in hash) sb.Append(b.ToString("x2"));
-            return sb.ToString();
+            Span<byte> buffer = stackalloc byte[8192];
+            int read;
+            while ((read = fs.Read(buffer)) > 0)
+            {
+                for (var i = 0; i < read; i++)
+                {
+                    hash ^= buffer[i];
+                    hash *= prime;
+                }
+            }
+
+            return hash.ToString("x16", System.Globalization.CultureInfo.InvariantCulture);
         }
         catch
         {
@@ -387,6 +421,20 @@ public sealed class CodeExtractor
                 stack.Push(d);
             }
         }
+    }
+
+    static string PartitionKey(string root, string filePath)
+    {
+        var rel = Path.GetRelativePath(root, filePath);
+        if (string.IsNullOrEmpty(rel) || rel == ".")
+            return PartitionKeyRoot;
+
+        var normalized = rel.Replace('\\', '/');
+        if (normalized.StartsWith("../", StringComparison.Ordinal))
+            return PartitionKeyRoot;
+
+        var slash = normalized.IndexOf('/');
+        return slash == -1 ? PartitionKeyRoot : normalized.Substring(0, slash);
     }
 
     static void WriteTreeManifest(StreamWriter w, string root)

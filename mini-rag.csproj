@@ -16,4 +16,5 @@
     <None Remove="project/**/*" />
     <Content Remove="project/**/*" />
   </ItemGroup>
+
 </Project>
