@@ -1,4 +1,4 @@
-// setup.cs (library component)
+// SetupRunner.cs
 using System;
 using System.IO;
 using System.Net.Http;
@@ -264,7 +264,11 @@ public sealed class SetupRunner : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync() => _http.Dispose();
+    public ValueTask DisposeAsync()
+    {
+        _http.Dispose();
+        return ValueTask.CompletedTask;
+    }
 
     sealed class TagsResponse { public TagItem[] models { get; set; } = Array.Empty<TagItem>(); }
     sealed class TagItem { public string name { get; set; } = ""; }

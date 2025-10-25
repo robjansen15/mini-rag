@@ -1,18 +1,7 @@
-// run.cs (library component)
-using System;
-using System.Buffers;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Json;
+// RagRuntime.cs
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading;
-using System.Threading.Channels;
-using System.Threading.Tasks;
 
 namespace RagLib;
 
@@ -31,11 +20,9 @@ public sealed class RagRuntime : IAsyncDisposable
     readonly RagOptions _opts;
     readonly HttpClient _http;
     readonly List<string> _texts = new();
-    readonly List<(int start, int length)> _docSpans = new();
     readonly List<SparseVec> _docVecs = new();
     readonly Dictionary<string, int> _vocab = new(StringComparer.OrdinalIgnoreCase);
     float[]? _idf;
-    int _tokenCount;
     bool _built;
 
     public RagRuntime(RagOptions opts)
@@ -68,135 +55,63 @@ public sealed class RagRuntime : IAsyncDisposable
     {
         if (_texts.Count == 0) throw new InvalidOperationException("No texts loaded");
         _vocab.Clear();
-        _docSpans.Clear();
         _docVecs.Clear();
         _idf = null;
         _built = false;
+        _docVecs.Capacity = Math.Max(_docVecs.Capacity, _texts.Count);
+        var docTermCounts = new List<Dictionary<int, int>>(_texts.Count);
+        var dfCounts = new List<int>();
 
-        var offsets = new (int start, int len)[_texts.Count];
-        var allTokens = new List<int>(_texts.Count * 64);
-        var df = new ConcurrentDictionary<int, int>();
-        var threads = Math.Max(1, _opts.IndexThreads);
-        var part = Math.Max(1, _texts.Count / threads);
-        var localVocabBoxes = new ConcurrentBag<Dictionary<string, int>>();
-
-        Parallel.For(0, threads, new ParallelOptions { MaxDegreeOfParallelism = threads, CancellationToken = ct }, tid =>
+        foreach (var text in _texts)
         {
-            var vocabLocal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var seenPerDoc = new HashSet<int>();
-            int start = tid * part;
-            int end = tid == threads - 1 ? _texts.Count : Math.Min(_texts.Count, start + part);
-            var localTokens = new List<int>((end - start) * 64);
-            var localOffsets = new List<(int s, int l)>(end - start);
-            for (int i = start; i < end; i++)
+            ct.ThrowIfCancellationRequested();
+            var counts = new Dictionary<int, int>();
+            var seen = new HashSet<int>();
+            foreach (var token in Tokenize(text))
             {
                 ct.ThrowIfCancellationRequested();
-                seenPerDoc.Clear();
-                int s = localTokens.Count;
-                foreach (var tok in Tokenize(_texts[i]))
+                var id = EnsureTokenId(token, dfCounts);
+                counts[id] = counts.TryGetValue(id, out var c) ? c + 1 : 1;
+                if (seen.Add(id))
                 {
-                    if (!vocabLocal.TryGetValue(tok, out var id))
-                    {
-                        id = vocabLocal.Count;
-                        vocabLocal[tok] = id;
-                    }
-                    localTokens.Add(id);
-                }
-                int l = localTokens.Count - s;
-                localOffsets.Add((s, l));
-                for (int k = 0; k < l; k++)
-                {
-                    var id = localTokens[s + k];
-                    if (seenPerDoc.Add(id)) { }
+                    dfCounts[id] = dfCounts[id] + 1;
                 }
             }
-            lock (localVocabBoxes) localVocabBoxes.Add(vocabLocal);
-            lock (offsets)
-            {
-                int ptr = 0;
-                for (int i = start; i < end; i++) { offsets[i] = localOffsets[ptr++]; }
-            }
-            lock (allTokens) allTokens.AddRange(localTokens);
-        });
-
-        foreach (var local in localVocabBoxes)
-        {
-            foreach (var kv in local)
-            {
-                if (!_vocab.ContainsKey(kv.Key)) _vocab[kv.Key] = _vocab.Count;
-            }
+            docTermCounts.Add(counts);
         }
 
-        var remappedTokens = ArrayPool<int>.Shared.Rent(allTokens.Count);
-        try
+        var vocabSize = _vocab.Count;
+        _idf = new float[vocabSize];
+        var totalDocs = (float)_texts.Count;
+        for (int i = 0; i < vocabSize; i++)
         {
-            int pos = 0;
-            foreach (var t in allTokens)
-            {
-                var globalId = RemapIdAcrossVocabBoxes(t, localVocabBoxes, _vocab);
-                remappedTokens[pos++] = globalId;
-            }
-            _tokenCount = pos;
-
-            _idf = new float[_vocab.Count];
-            var dfCounts = new int[_vocab.Count];
-            for (int d = 0; d < _texts.Count; d++)
-            {
-                ct.ThrowIfCancellationRequested();
-                var (s, l) = offsets[d];
-                var seen = new HashSet<int>();
-                for (int k = 0; k < l; k++)
-                {
-                    var id = remappedTokens[s + k];
-                    if (seen.Add(id)) dfCounts[id]++;
-                }
-            }
-            var N = (float)_texts.Count;
-            for (int t = 0; t < _idf.Length; t++)
-            {
-                var dfv = dfCounts[t] == 0 ? 1 : dfCounts[t];
-                _idf[t] = MathF.Log((N + 1f) / (dfv + 0.5f)) + 1f;
-            }
-
-            _docVecs.Capacity = _texts.Count;
-            for (int d = 0; d < _texts.Count; d++)
-            {
-                ct.ThrowIfCancellationRequested();
-                var (s, l) = offsets[d];
-                if (l == 0) { _docVecs.Add(new SparseVec(Array.Empty<int>(), Array.Empty<float>(), 0f)); continue; }
-                var counts = new Dictionary<int, int>();
-                for (int k = 0; k < l; k++)
-                {
-                    var id = remappedTokens[s + k];
-                    counts[id] = counts.TryGetValue(id, out var c) ? c + 1 : 1;
-                }
-                var idx = counts.Keys.OrderBy(x => x).ToArray();
-                var vals = new float[idx.Length];
-                float norm = 0f;
-                for (int i = 0; i < idx.Length; i++)
-                {
-                    var tf = counts[idx[i]];
-                    var w = (1f + MathF.Log(tf)) * _idf[idx[i]];
-                    vals[i] = w;
-                    norm += w * w;
-                }
-                norm = MathF.Sqrt(norm) + 1e-8f;
-                for (int i = 0; i < vals.Length; i++) vals[i] /= norm;
-                _docVecs.Add(new SparseVec(idx, vals, norm));
-            }
-        }
-        finally
-        {
-            ArrayPool<int>.Shared.Return(remappedTokens, clearArray: true);
+            var dfv = dfCounts[i] == 0 ? 1 : dfCounts[i];
+            _idf[i] = MathF.Log((totalDocs + 1f) / (dfv + 0.5f)) + 1f;
         }
 
-        _docSpans.Clear();
-        int acc = 0;
-        for (int i = 0; i < offsets.Length; i++)
+        foreach (var counts in docTermCounts)
         {
-            _docSpans.Add((offsets[i].start, offsets[i].len));
-            acc += offsets[i].len;
+            if (counts.Count == 0)
+            {
+                _docVecs.Add(new SparseVec(Array.Empty<int>(), Array.Empty<float>(), 0f));
+                continue;
+            }
+
+            var idx = counts.Keys.OrderBy(x => x).ToArray();
+            var vals = new float[idx.Length];
+            float norm = 0f;
+            for (int i = 0; i < idx.Length; i++)
+            {
+                var tf = counts[idx[i]];
+                var w = (1f + MathF.Log(tf)) * _idf[idx[i]];
+                vals[i] = w;
+                norm += w * w;
+            }
+            norm = MathF.Sqrt(norm) + 1e-8f;
+            for (int i = 0; i < vals.Length; i++) vals[i] /= norm;
+            _docVecs.Add(new SparseVec(idx, vals, norm));
         }
+
         _built = true;
     }
 
@@ -304,6 +219,17 @@ public sealed class RagRuntime : IAsyncDisposable
         return s;
     }
 
+    int EnsureTokenId(string token, List<int> dfCounts)
+    {
+        if (!_vocab.TryGetValue(token, out var id))
+        {
+            id = _vocab.Count;
+            _vocab[token] = id;
+            dfCounts.Add(0);
+        }
+        return id;
+    }
+
     static IEnumerable<string> Tokenize(string text)
     {
         var sb = new StringBuilder();
@@ -315,22 +241,11 @@ public sealed class RagRuntime : IAsyncDisposable
         if (sb.Length > 0) yield return sb.ToString();
     }
 
-    static int RemapIdAcrossVocabBoxes(int localId, IEnumerable<Dictionary<string,int>> boxes, Dictionary<string,int> global)
+    public ValueTask DisposeAsync()
     {
-        foreach (var box in boxes)
-        {
-            if (localId < box.Count)
-            {
-                // Not reliable to map by ordinal; resolve by key is required.
-                // We can't recover key from id here; this is avoided by rebuilding tokens via merged vocab.
-                // Fallback: use localId as hash seed; reduce collisions via modulo.
-                // To ensure correctness, we rebuild tokens during merge; see below.
-            }
-        }
-        return localId; // Will be replaced below by merged pass; kept for completeness.
+        _http.Dispose();
+        return ValueTask.CompletedTask;
     }
-
-    public async ValueTask DisposeAsync() => _http.Dispose();
 
     readonly record struct SparseVec(int[] Idx, float[] Val, float Norm);
 

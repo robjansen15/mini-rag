@@ -1,4 +1,4 @@
-// extract.cs
+// CodeExtractor.cs
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -10,6 +10,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using ExtractorLib.Internal;
 
 namespace ExtractorLib;
 
@@ -33,34 +34,6 @@ public sealed class CodeExtractor
         _scanThreads = Math.Max(1, opts.Threads);
     }
 
-    static readonly HashSet<string> AllowedExts = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".py",".ipynb",".js",".mjs",".cjs",".ts",".tsx",".jsx",".vue",".svelte",".java",".kt",".kts",".scala",".go",".rs",
-        ".c",".h",".cpp",".cc",".cxx",".hpp",".hh",".m",".mm",".cs",".fs",".fsx",".php",".rb",".swift",".lua",".pl",".pm",".r",
-        ".dart",".groovy",".gradle",".sql",".proto",".graphql",".gql",
-        ".json",".json5",".toml",".ini",".cfg",".conf",".yaml",".yml",".env",".properties",".xml",
-        ".html",".htm",".css",".scss",".sass",".less",
-        ".md",".markdown",".rst",".adoc",".txt",".csv",".tsv",".log",".org",
-    };
-
-    static readonly Dictionary<string,string> SpecialBasenames = new(StringComparer.Ordinal)
-    {
-        ["Dockerfile"]="dockerfile",["Makefile"]="make",["CMakeLists.txt"]="cmake",
-        ["BUILD"]="bazel",["WORKSPACE"]="bazel",["Podfile"]="cocoapods",["Gemfile"]="ruby-gems",
-        ["requirements.txt"]="python-reqs",["environment.yml"]="conda-env",["Pipfile"]="pipenv",["Pipfile.lock"]="pipenv-lock",
-        ["package.json"]="npm",["pnpm-lock.yaml"]="pnpm-lock",["yarn.lock"]="yarn-lock",["poetry.lock"]="poetry-lock",["pyproject.toml"]="pyproject",
-        ["Cargo.toml"]="cargo",["Cargo.lock"]="cargo-lock",["go.mod"]="gomod",["go.sum"]="gosum",
-        ["composer.json"]="composer",["composer.lock"]="composer-lock",["pom.xml"]="maven",
-        ["build.gradle.kts"]="gradle-kts",["build.gradle"]="gradle",
-        [".gitignore"]="git",[ ".gitattributes"]="git",[ ".editorconfig"]="editor",
-    };
-
-    static readonly HashSet<string> IgnoreDirs = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".git",".hg",".svn",".bzr","node_modules","dist","build","out","target",
-        ".idea",".vscode",".vs","__pycache__",".venv","venv",".mypy_cache",".pytest_cache",".gradle",".next",".nuxt",".parcel-cache"
-    };
-
     public void Extract(CancellationToken ct = default)
     {
         var root = Path.GetFullPath(_opts.ProjectRoot);
@@ -81,7 +54,7 @@ public sealed class CodeExtractor
             w.Flush();
         }
 
-        var dfsFiles = EnumerateFilesDFS(root).Where(IsAllowedFile).ToList();
+        var dfsFiles = EnumerateFilesDFS(root).Where(FileRules.IsAllowedFile).ToList();
         var totalFiles = dfsFiles.Count;
         Console.WriteLine($"Found {totalFiles} files to scan");
         
@@ -124,7 +97,7 @@ public sealed class CodeExtractor
             ct.ThrowIfCancellationRequested();
             var fileHash = ComputeFileHash(file);
             var rel = Path.GetRelativePath(root, file);
-            var fileId = BuildIdForFile(rel);
+            var fileId = CorpusIdFactory.ForFile(rel);
             
             if (existingEntries.TryGetValue(fileId, out var existing) && existing.hash == fileHash)
             {
@@ -224,7 +197,7 @@ public sealed class CodeExtractor
                 foreach (var (file, _) in filesToProcess)
                 {
                     var rel = Path.GetRelativePath(root, file);
-                    var fileId = BuildIdForFile(rel);
+                    var fileId = CorpusIdFactory.ForFile(rel);
                     processedFileIds.Add(fileId);
                 }
                 
@@ -401,7 +374,7 @@ public sealed class CodeExtractor
             foreach (var d in dirs.OrderByDescending(s => s, StringComparer.Ordinal))
             {
                 var name = Path.GetFileName(d);
-                if (IgnoreDirs.Contains(name)) continue;
+                if (FileRules.IsIgnoredDirectory(name)) continue;
                 stack.Push(d);
             }
         }
@@ -434,26 +407,26 @@ public sealed class CodeExtractor
             if (depth > 0) yield return (depth, cur, null);
             foreach (var f in files) yield return (depth, null, f);
 
-            foreach (var d in dirs.Where(d => !IgnoreDirs.Contains(Path.GetFileName(d))).OrderByDescending(s => s, StringComparer.Ordinal))
+            foreach (var d in dirs.Where(d => !FileRules.IsIgnoredDirectory(Path.GetFileName(d))).OrderByDescending(s => s, StringComparer.Ordinal))
                 stack.Push((d, depth + 1));
         }
     }
 
     IEnumerable<string> ProcessFile(string root, string file)
     {
-        if (!IsAllowedFile(file)) yield break;
+        if (!FileRules.IsAllowedFile(file)) yield break;
 
-        var text = ReadTextFile(file, _opts.MaxBytes);
+        var text = DocumentBuilder.ReadTextFile(file, _opts.MaxBytes, _opts.Truncate);
         if (text == null) yield break;
 
-        var lang = DetectLang(file);
+        var lang = FileRules.DetectLanguage(file);
         var rel = Path.GetRelativePath(root, file);
         var abs = Path.GetFullPath(file);
-        var contentWithCtx = BuildTextWithContext(root, rel, abs, lang, text.Value.Content);
+        var contentWithCtx = DocumentBuilder.BuildTextWithContext(root, rel, abs, lang, text.Value.Content);
 
         var fileObj = new JsonObj
         {
-            id = BuildIdForFile(rel),
+            id = CorpusIdFactory.ForFile(rel),
             type = "file",
             title = ExtractionTools.HeuristicFileTitle(rel, lang, text.Value.Content),
             path = rel.Replace('\\','/'),
@@ -471,7 +444,7 @@ public sealed class CodeExtractor
         {
             var clsObj = new JsonObj
             {
-                id = BuildIdForClass(rel, cls.name),
+                id = CorpusIdFactory.ForClass(rel, cls.name),
                 type = "class",
                 title = ExtractionTools.HeuristicClassTitle(cls.name, rel, lang, cls.body),
                 class_name = cls.name,
@@ -481,7 +454,7 @@ public sealed class CodeExtractor
                 lang = lang,
                 size = cls.body.Length,
                 hash = ExtractionTools.Sha256(cls.body),
-                text = BuildTextWithContext(root, rel, abs, lang, cls.body)
+                text = DocumentBuilder.BuildTextWithContext(root, rel, abs, lang, cls.body)
             };
             yield return JsonSerializer.Serialize(clsObj);
         }
@@ -491,7 +464,7 @@ public sealed class CodeExtractor
         {
             var fnObj = new JsonObj
             {
-                id = BuildIdForFunction(rel, fn.name),
+                id = CorpusIdFactory.ForFunction(rel, fn.name),
                 type = "function",
                 title = ExtractionTools.HeuristicFunctionTitle(fn.name, rel, lang, fn.body),
                 function = fn.name,
@@ -501,7 +474,7 @@ public sealed class CodeExtractor
                 lang = lang,
                 size = fn.body.Length,
                 hash = ExtractionTools.Sha256(fn.body),
-                text = BuildTextWithContext(root, rel, abs, lang, fn.body)
+                text = DocumentBuilder.BuildTextWithContext(root, rel, abs, lang, fn.body)
             };
             yield return JsonSerializer.Serialize(fnObj);
         }

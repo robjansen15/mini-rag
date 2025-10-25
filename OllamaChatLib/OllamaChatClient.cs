@@ -1,4 +1,4 @@
-// chat.cs
+// OllamaChatClient.cs
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
@@ -61,7 +61,11 @@ public sealed class OllamaChatClient : IAsyncDisposable
         return text.Trim();
     }
 
-    public async ValueTask DisposeAsync() => _http.Dispose();
+    public ValueTask DisposeAsync()
+    {
+        _http.Dispose();
+        return ValueTask.CompletedTask;
+    }
 
     // ---- Data Models ----
 
