@@ -51,7 +51,7 @@ namespace ScriptRunner
         public string CurrentLinkName { get; set; } = "llama1b";
         
         // Performance Configuration
-        public int Threads { get; set; } = Math.Max(1, Environment.ProcessorCount / 2);
+        public int Threads { get; set; } = 16;
         
         // RAG Configuration
         public int NumPredict { get; set; } = 300;

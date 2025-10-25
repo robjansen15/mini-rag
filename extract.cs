@@ -75,7 +75,11 @@ public sealed class CodeExtractor
         }
 
         var dfsFiles = EnumerateFilesDFS(root).Where(IsAllowedFile).ToList();
+        var totalFiles = dfsFiles.Count;
+        Console.WriteLine($"Found {totalFiles} files to process");
+        
         var index = new ConcurrentDictionary<string,int>(StringComparer.Ordinal);
+        var processedCount = 0;
         var i = 0;
 
         while (i < dfsFiles.Count)
@@ -114,9 +118,16 @@ public sealed class CodeExtractor
                 }
             }
 
+            processedCount += round.Count;
+            var percentage = (processedCount * 100.0) / totalFiles;
+            Console.Write($"\rProgress: {processedCount}/{totalFiles} files ({percentage:F1}%)");
+
             Array.Clear(results, 0, results.Length);
             i += round.Count;
         }
+        
+        Console.WriteLine(); // New line after progress is complete
+        Console.WriteLine("Extraction complete!");
     }
 
     static IEnumerable<string> EnumerateFilesDFS(string root)
