@@ -194,8 +194,8 @@ public sealed class RagRuntime : IAsyncDisposable
         int acc = 0;
         for (int i = 0; i < offsets.Length; i++)
         {
-            _docSpans.Add(offsets[i]);
-            acc += offsets[i].length;
+            _docSpans.Add((offsets[i].start, offsets[i].len));
+            acc += offsets[i].len;
         }
         _built = true;
     }
@@ -322,7 +322,7 @@ public sealed class RagRuntime : IAsyncDisposable
             if (localId < box.Count)
             {
                 // Not reliable to map by ordinal; resolve by key is required.
-                // We can’t recover key from id here; this is avoided by rebuilding tokens via merged vocab.
+                // We can't recover key from id here; this is avoided by rebuilding tokens via merged vocab.
                 // Fallback: use localId as hash seed; reduce collisions via modulo.
                 // To ensure correctness, we rebuild tokens during merge; see below.
             }
@@ -370,5 +370,70 @@ public sealed class RagRuntime : IAsyncDisposable
         }
         if (inTok == 1) c++;
         return Math.Max(1, c);
+    }
+
+    // TopK heap structure for efficient top-k retrieval
+    sealed class TopK
+    {
+        readonly (int index, float score)[] _heap;
+        int _size;
+        readonly int _k;
+
+        public TopK(int k)
+        {
+            _k = k;
+            _heap = new (int index, float score)[k];
+            _size = 0;
+        }
+
+        public void Add((int index, float score) item)
+        {
+            if (_size < _k)
+            {
+                _heap[_size++] = item;
+                if (_size == _k) Heapify();
+            }
+            else if (item.score > _heap[0].score)
+            {
+                _heap[0] = item;
+                SiftDown(0);
+            }
+        }
+
+        public List<(int index, float score)> GetSorted()
+        {
+            var result = new List<(int index, float score)>(_size);
+            for (int i = 0; i < _size; i++)
+            {
+                result.Add(_heap[i]);
+            }
+            result.Sort((a, b) => b.score.CompareTo(a.score));
+            return result;
+        }
+
+        void Heapify()
+        {
+            for (int i = _size / 2 - 1; i >= 0; i--)
+            {
+                SiftDown(i);
+            }
+        }
+
+        void SiftDown(int pos)
+        {
+            var item = _heap[pos];
+            while (pos < _size / 2)
+            {
+                int child = 2 * pos + 1;
+                if (child + 1 < _size && _heap[child + 1].score < _heap[child].score)
+                {
+                    child++;
+                }
+                if (item.score <= _heap[child].score) break;
+                _heap[pos] = _heap[child];
+                pos = child;
+            }
+            _heap[pos] = item;
+        }
     }
 }

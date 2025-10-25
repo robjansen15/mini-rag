@@ -220,6 +220,133 @@ public sealed class CodeExtractor
         }
     }
 
+    static IEnumerable<(string name, string body)> ExtractFunctions(string rel, string lang, string content)
+    {
+        // Simple pattern matching for common function definitions
+        // This is a heuristic approach - can be enhanced with proper parsing
+        
+        var patterns = new Dictionary<string, string>
+        {
+            // C#, Java, C, C++, JavaScript, TypeScript
+            ["cs"] = @"(?:public|private|protected|internal|static|\s)+(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
+            ["java"] = @"(?:public|private|protected|static|\s)+(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
+            ["c"] = @"(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
+            ["cpp"] = @"(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
+            ["js"] = @"(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:function|\([^)]*\)\s*=>))",
+            ["ts"] = @"(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:function|\([^)]*\)\s*=>))",
+            ["jsx"] = @"(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:function|\([^)]*\)\s*=>))",
+            ["tsx"] = @"(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:function|\([^)]*\)\s*=>))",
+            
+            // Python
+            ["py"] = @"def\s+(\w+)\s*\([^)]*\)\s*:",
+            
+            // Go
+            ["go"] = @"func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\([^)]*\)",
+            
+            // Rust
+            ["rs"] = @"fn\s+(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)",
+            
+            // PHP
+            ["php"] = @"function\s+(\w+)\s*\([^)]*\)",
+            
+            // Ruby
+            ["rb"] = @"def\s+(\w+)",
+            
+            // Swift
+            ["swift"] = @"func\s+(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)",
+        };
+
+        if (!patterns.TryGetValue(lang, out var pattern))
+            yield break;
+
+        var regex = new Regex(pattern, RegexOptions.Multiline);
+        var matches = regex.Matches(content);
+
+        foreach (Match match in matches)
+        {
+            var functionName = match.Groups[1].Success ? match.Groups[1].Value : 
+                              match.Groups[2].Success ? match.Groups[2].Value : null;
+            
+            if (string.IsNullOrWhiteSpace(functionName))
+                continue;
+
+            // Extract function body - simple approach: find matching braces or end of block
+            var startIndex = match.Index;
+            var endIndex = FindFunctionEnd(content, startIndex, lang);
+            
+            if (endIndex > startIndex)
+            {
+                var body = content.Substring(startIndex, endIndex - startIndex);
+                if (body.Length > 10 && body.Length < 50000) // Skip very small or very large functions
+                {
+                    yield return (functionName, body);
+                }
+            }
+        }
+    }
+
+    static int FindFunctionEnd(string content, int startIndex, string lang)
+    {
+        // For brace-based languages, find matching closing brace
+        if (new[] { "cs", "java", "c", "cpp", "js", "ts", "jsx", "tsx", "go", "rs", "php", "swift" }.Contains(lang))
+        {
+            var braceCount = 0;
+            var foundOpenBrace = false;
+            
+            for (int i = startIndex; i < content.Length; i++)
+            {
+                if (content[i] == '{')
+                {
+                    braceCount++;
+                    foundOpenBrace = true;
+                }
+                else if (content[i] == '}')
+                {
+                    braceCount--;
+                    if (foundOpenBrace && braceCount == 0)
+                    {
+                        return i + 1;
+                    }
+                }
+            }
+        }
+        // For Python/Ruby, find next function definition or end of indentation
+        else if (lang == "py" || lang == "rb")
+        {
+            var lines = content.Substring(startIndex).Split('\n');
+            if (lines.Length == 0) return startIndex + 100;
+            
+            var firstLine = lines[0];
+            var baseIndent = firstLine.Length - firstLine.TrimStart().Length;
+            
+            var bodyLength = firstLine.Length;
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var line = lines[i];
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    bodyLength += line.Length + 1;
+                    continue;
+                }
+                
+                var indent = line.Length - line.TrimStart().Length;
+                if (indent <= baseIndent && line.TrimStart().StartsWith("def "))
+                {
+                    break;
+                }
+                
+                bodyLength += line.Length + 1;
+                
+                if (bodyLength > 10000) break; // Limit function size
+            }
+            
+            return Math.Min(startIndex + bodyLength, content.Length);
+        }
+        
+        // Default: take next 500 characters
+        return Math.Min(startIndex + 500, content.Length);
+    }
+
     static bool IsAllowedFile(string file)
     {
         var name = Path.GetFileName(file);

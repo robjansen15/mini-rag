@@ -40,7 +40,6 @@ public sealed class OllamaChatClient : IAsyncDisposable
     public async Task<string> ChatAsync(IEnumerable<ChatMessage> messages, CancellationToken ct = default)
     {
         var url = _opts.Host.TrimEnd('/') + "/api/chat";
-
         var reqBody = new ChatRequest
         {
             model = _opts.ModelTag,
@@ -58,7 +57,7 @@ public sealed class OllamaChatClient : IAsyncDisposable
 
         var json = await resp.Content.ReadAsStringAsync(ct);
         var obj = JsonSerializer.Deserialize<ChatResponse>(json) ?? new ChatResponse();
-        var text = obj.message?.content ?? obj.response ?? "";
+        var text = obj.message?.Content ?? obj.response ?? "";
         return text.Trim();
     }
 
@@ -68,8 +67,11 @@ public sealed class OllamaChatClient : IAsyncDisposable
 
     public sealed class ChatMessage
     {
-        [JsonPropertyName("role")] public string Role { get; set; }
-        [JsonPropertyName("content")] public string Content { get; set; }
+        [JsonPropertyName("role")] 
+        public string Role { get; set; }
+        
+        [JsonPropertyName("content")] 
+        public string Content { get; set; }
 
         public ChatMessage(string role, string content)
         {
