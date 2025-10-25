@@ -20,9 +20,31 @@ namespace ScriptRunner
         public string OllamaHost { get; set; } = "http://127.0.0.1:11434";
         public string ModelTag { get; set; } = "llama3.2:1b-instruct-fp16";
         
-        // Path Configuration
-        public string BaseDir { get; set; } = AppContext.BaseDirectory;
-        public string DataPath { get; set; } = Path.Combine(AppContext.BaseDirectory, "data", "corpus.jsonl");
+        // Path Configuration - Use project root instead of bin directory
+        private static string GetProjectRoot()
+        {
+            // Start from the assembly location and walk up to find the project root
+            var assemblyPath = AppContext.BaseDirectory;
+            var dir = new DirectoryInfo(assemblyPath);
+            
+            // Walk up from bin/Debug/net9.0 to project root
+            while (dir != null && dir.Parent != null)
+            {
+                // Look for .csproj file or other project markers
+                if (dir.GetFiles("*.csproj").Length > 0 || 
+                    dir.GetFiles("Program.cs").Length > 0)
+                {
+                    return dir.FullName;
+                }
+                dir = dir.Parent;
+            }
+            
+            // Fallback to current directory
+            return Directory.GetCurrentDirectory();
+        }
+        
+        public string BaseDir { get; set; } = GetProjectRoot();
+        public string DataPath { get; set; } = Path.Combine(GetProjectRoot(), "data", "corpus.jsonl");
         public string ProjectRoot { get; set; } = ".";
         
         // Setup Configuration
