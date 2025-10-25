@@ -16,6 +16,7 @@ public sealed class AppConfiguration
     public string DataDirectory { get; init; }
     public string BaseDir { get; init; }
     public string DataPath { get; init; }
+    public string SemanticSummaryPath { get; init; }
 
     public string CurrentLinkName { get; init; } = "llama1b";
     public int Threads { get; init; } = 16;
@@ -31,6 +32,7 @@ public sealed class AppConfiguration
         DataDirectory = Path.Combine(CurrentPath, "Data");
         BaseDir = projectRoot;
         DataPath = Path.Combine(DataDirectory, "corpus.jsonl");
+        SemanticSummaryPath = Path.Combine(DataDirectory, "semantic-summaries.jsonl");
     }
 
     static string LocateProjectRoot()

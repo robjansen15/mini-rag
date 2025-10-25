@@ -20,6 +20,7 @@ public sealed class RagRuntime : IAsyncDisposable
     readonly RagOptions _opts;
     readonly HttpClient _http;
     readonly List<string> _texts = new();
+    readonly List<string> _paths = new();
     readonly List<SparseVec> _docVecs = new();
     readonly Dictionary<string, int> _vocab = new(StringComparer.OrdinalIgnoreCase);
     float[]? _idf;
@@ -32,11 +33,13 @@ public sealed class RagRuntime : IAsyncDisposable
     }
 
     public IReadOnlyList<string> Texts => _texts;
+    public IReadOnlyList<string> Paths => _paths;
 
     public void LoadCorpus(CancellationToken ct = default)
     {
         if (!File.Exists(_opts.DataPath)) throw new FileNotFoundException(_opts.DataPath);
         _texts.Clear();
+        _paths.Clear();
         using var fs = File.OpenRead(_opts.DataPath);
         using var sr = new StreamReader(fs, new UTF8Encoding(false));
         string? line;
@@ -48,6 +51,8 @@ public sealed class RagRuntime : IAsyncDisposable
             if (!jd.RootElement.TryGetProperty("text", out var te)) continue;
             var t = te.GetString() ?? "";
             _texts.Add(t);
+            var path = jd.RootElement.TryGetProperty("path", out var pe) ? pe.GetString() ?? string.Empty : string.Empty;
+            _paths.Add(path);
         }
     }
 
@@ -126,7 +131,7 @@ public sealed class RagRuntime : IAsyncDisposable
         onStatus?.Invoke("Index ready");
     }
 
-    public IReadOnlyList<(int index, float score, string text)> Retrieve(string query, int k = 3, CancellationToken ct = default)
+    public IReadOnlyList<DocHit> Retrieve(string query, int k = 3, CancellationToken ct = default)
     {
         if (!_built) throw new InvalidOperationException("Index not built");
         var q = ToSparse(query, ct);
@@ -137,7 +142,7 @@ public sealed class RagRuntime : IAsyncDisposable
             var s = Cosine(q, _docVecs[i]);
             heap.Add((i, s));
         }
-        var res = heap.GetSorted().Select(t => (t.index, t.score, _texts[t.index])).ToList();
+        var res = heap.GetSorted().Select(t => new DocHit(t.index, t.score, _texts[t.index], _paths[t.index])).ToList();
         return res;
     }
 
@@ -259,6 +264,11 @@ public sealed class RagRuntime : IAsyncDisposable
     }
 
     readonly record struct SparseVec(int[] Idx, float[] Val, float Norm);
+
+    public readonly record struct DocHit(int Index, float Score, string Text, string Path)
+    {
+        public bool HasPath => !string.IsNullOrWhiteSpace(Path);
+    }
 
     public sealed record GenProgress
     {

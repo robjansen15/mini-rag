@@ -32,7 +32,7 @@ static class RunCommand
             Console.WriteLine($"Retrieving relevant documents for: {query}");
             var hits = rag.Retrieve(query, k: config.RetrievalTopK);
 
-            var ctx = string.Join("\n---\n", hits.Select(h => h.text));
+            var ctx = string.Join("\n---\n", hits.Select(h => h.Text));
 
             Console.WriteLine("Generating answer...");
             var answerTask = rag.GenerateToStringAsync($"Context:\n{ctx}\n\nAnswer clearly:");
