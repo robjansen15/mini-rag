@@ -211,7 +211,7 @@ public sealed class SemanticSummaryBuilder
                 : seed.IsBackend ? "backend" : "shared";
             var dependencies = root.TryGetProperty("dependencies", out var dEl)
                 ? ReadStringArray(dEl)
-                : seed.Dependencies ?? Array.Empty<string>();
+                : seed.Dependencies;
 
             return new SemanticNodeSummary
             {
@@ -237,7 +237,7 @@ public sealed class SemanticSummaryBuilder
                 Keywords = seed.FallbackKeywords,
                 Classification = seed.IsBackend ? "backend" : "shared",
                 Paths = seed.Paths.ToArray(),
-                Dependencies = seed.Dependencies ?? Array.Empty<string>(),
+                Dependencies = seed.Dependencies,
                 SchemaVersion = SummarySchemaVersion
             };
         }
@@ -252,7 +252,7 @@ public sealed class SemanticSummaryBuilder
         {
             sb.AppendLine("- " + path);
         }
-        if (seed.Dependencies is { Count: > 0 })
+        if (seed.Dependencies.Count > 0)
         {
             sb.AppendLine();
             sb.AppendLine("Observed dependencies: " + string.Join(", ", seed.Dependencies.Take(12)));
@@ -354,8 +354,10 @@ public sealed class SemanticSummaryBuilder
         }
     }
 
-    sealed record SummarySeed(string Id, List<string> Paths, StringBuilder Sample, bool IsBackend, IReadOnlyList<string> Dependencies)
+    sealed record SummarySeed(string Id, List<string> Paths, StringBuilder Sample, bool IsBackend, IReadOnlyList<string> DepList)
     {
+        public IReadOnlyList<string> Dependencies { get; } = DepList ?? Array.Empty<string>();
+
         public string FallbackSummary =>
             $"Module {Id} contains {Paths.Count} file(s) with focus on {(IsBackend ? "backend" : "shared")} responsibilities.";
 
@@ -379,7 +381,7 @@ public sealed class SemanticSummaryBuilder
 
 public sealed class SemanticSummaryBuilderOptions
 {
-    public int MaxGroups { get; init; } = 40;
+    public int MaxGroups { get; init; } = 120;
     public int MaxSampleChars { get; init; } = 4000;
     public int MinSampleChars { get; init; } = 400;
 }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using OllamaChatLib;
@@ -89,7 +90,7 @@ static class ChatCommand
         SemanticSummaryStore summaryStore)
     {
         var expansion = await QueryExpander.ExpandAsync(message, client).ConfigureAwait(false);
-        var semanticNodes = summaryStore.Search(expansion, config.RetrievalTopK).ToList();
+        var semanticNodes = summaryStore.Search(expansion, config.RetrievalTopK * 2).ToList();
 
         if (!string.IsNullOrWhiteSpace(expansion.Rewritten) &&
             !string.Equals(expansion.Rewritten, message, StringComparison.OrdinalIgnoreCase))
@@ -114,8 +115,8 @@ static class ChatCommand
             : expansion.Rewritten;
 
         Console.WriteLine($"Retrieving relevant documents for: {retrievalQuery}");
-        var rawHits = rag.Retrieve(retrievalQuery, k: Math.Max(config.RetrievalTopK * 2, config.RetrievalTopK + semanticNodes.Count));
-        var prioritized = ReRankHits(rawHits, semanticNodes, config.RetrievalTopK, expansion);
+        var aggregatedHits = CollectHits(rag, retrievalQuery, semanticNodes, config, expansion);
+        var prioritized = ReRankHits(aggregatedHits, semanticNodes, config.RetrievalTopK, expansion);
 
         const float minScore = 0.05f;
         var bestScore = prioritized.Count > 0 ? prioritized.Max(h => h.Score) : 0f;
@@ -131,10 +132,11 @@ static class ChatCommand
 
         if (filtered.Count < config.RetrievalTopK)
         {
+            var seen = new HashSet<int>(filtered.Select(h => h.Hit.Index));
             foreach (var extra in prioritized)
             {
                 if (filtered.Count >= config.RetrievalTopK) break;
-                if (!filtered.Contains(extra)) filtered.Add(extra);
+                if (seen.Add(extra.Hit.Index)) filtered.Add(extra);
             }
         }
 
@@ -148,13 +150,13 @@ static class ChatCommand
             for (int i = 0; i < filtered.Count; i++)
             {
                 var hit = filtered[i];
-                var preview = hit.Text.Length > 160 ? hit.Text[..160] + "..." : hit.Text;
-                Console.WriteLine($"    [{i + 1}] score={hit.Score:F3} path={hit.Path} preview={preview.Replace("\n", " ")}");
+                var preview = hit.Hit.Text.Length > 160 ? hit.Hit.Text[..160] + "..." : hit.Hit.Text;
+                Console.WriteLine($"    [{i + 1}] score={hit.Score:F3} path={hit.Hit.Path} preview={preview.Replace("\n", " ")}");
             }
         }
 
         var semanticContext = BuildSemanticContext(semanticNodes);
-        var excerpts = string.Join("\n---\n", filtered.Select(h => TruncateForContext(h.Text)));
+        var excerpts = string.Join("\n---\n", filtered.Select(h => TruncateForContext(h.Hit.Text)));
 
         var systemSections = new List<string>();
         if (!string.IsNullOrWhiteSpace(semanticContext))
@@ -189,21 +191,105 @@ static class ChatCommand
         return reply;
     }
 
-    static List<RagRuntime.DocHit> ReRankHits(
-        IReadOnlyList<RagRuntime.DocHit> hits,
+    static List<RankedHit> CollectHits(
+        RagRuntime rag,
+        string baseQuery,
+        IReadOnlyList<SemanticSummaryStore.ScoredNode> nodes,
+        AppConfiguration config,
+        QueryExpansion expansion)
+    {
+        var map = new Dictionary<int, DocAggregate>();
+
+        void Merge(IReadOnlyList<RagRuntime.DocHit> hits, SemanticSummaryStore.ScoredNode? source)
+        {
+            foreach (var hit in hits)
+            {
+                if (!map.TryGetValue(hit.Index, out var aggregate))
+                {
+                    aggregate = new DocAggregate(hit);
+                    map[hit.Index] = aggregate;
+                }
+                else if (hit.Score > aggregate.Hit.Score)
+                {
+                    aggregate.Hit = hit;
+                }
+
+                aggregate.CompositeScore = Math.Max(aggregate.CompositeScore, hit.Score);
+
+                if (source.HasValue)
+                {
+                    aggregate.NodeIds.Add(source.Value.Node.Id);
+                    aggregate.CompositeScore += source.Value.Score * 0.05f;
+                    if (source.Value.Node.IsBackend)
+                    {
+                        aggregate.CompositeScore *= 1.02f;
+                    }
+                }
+            }
+        }
+
+        var baseHits = rag.Retrieve(baseQuery, k: Math.Max(config.RetrievalTopK * 4, 12));
+        Merge(baseHits, null);
+
+        var nodeLimit = Math.Min(nodes.Count, Math.Max(config.RetrievalTopK, 3));
+        for (int i = 0; i < nodeLimit; i++)
+        {
+            var node = nodes[i];
+            var nodeQuery = BuildNodeQuery(baseQuery, node.Node, expansion);
+            var nodeHits = rag.Retrieve(nodeQuery, k: Math.Max(config.RetrievalTopK * 2, 10));
+            Merge(nodeHits, node);
+        }
+
+        return map.Values
+            .Select(a => new RankedHit(a.Hit, a.CompositeScore, a.NodeIds))
+            .ToList();
+    }
+
+    static string BuildNodeQuery(string baseQuery, SemanticNodeSummary node, QueryExpansion expansion)
+    {
+        var keywords = string.Join(' ', node.Keywords.Take(6));
+        var responsibilities = string.Join(' ', node.Responsibilities.Take(4));
+        var deps = string.Join(' ', node.Dependencies.Take(4));
+        var hints = string.Join(' ', node.Paths.Select(p => Path.GetFileNameWithoutExtension(p) ?? string.Empty).Where(s => !string.IsNullOrWhiteSpace(s)).Take(4));
+        var clarifiers = string.Join(' ', expansion.Keywords.Take(4));
+
+        return string.Join(' ', new[]
+        {
+            baseQuery,
+            keywords,
+            responsibilities,
+            deps,
+            hints,
+            clarifiers
+        }.Where(s => !string.IsNullOrWhiteSpace(s)));
+    }
+
+    static List<RankedHit> ReRankHits(
+        IReadOnlyList<RankedHit> hits,
         IReadOnlyList<SemanticSummaryStore.ScoredNode> nodes,
         int desired,
         QueryExpansion expansion)
     {
-        if (hits.Count == 0) return new List<RagRuntime.DocHit>();
+        if (hits.Count == 0) return new List<RankedHit>();
 
-        var scored = new List<(RagRuntime.DocHit Hit, float Score)>(hits.Count);
+        var nodeMap = nodes.ToDictionary(n => n.Node.Id, n => n, StringComparer.OrdinalIgnoreCase);
+
+        var scored = new List<RankedHit>(hits.Count);
         foreach (var hit in hits)
         {
             var score = hit.Score;
+
+            foreach (var nodeId in hit.NodeIds)
+            {
+                if (nodeMap.TryGetValue(nodeId, out var semanticNode))
+                {
+                    score += semanticNode.Score * 0.05f;
+                }
+            }
+
             foreach (var node in nodes)
             {
-                if (PathMatches(hit.Path, node.Node))
+                if (PathMatches(hit.Hit.Path, node.Node))
                 {
                     score *= 1.0f + MathF.Min(node.Score / 10f, 1.2f);
                     if (node.Node.IsBackend) score *= 1.1f;
@@ -211,19 +297,18 @@ static class ChatCommand
             }
 
             if (string.Equals(expansion.Priority, "backend", StringComparison.OrdinalIgnoreCase) &&
-                IsLikelyFrontend(hit.Path))
+                IsLikelyFrontend(hit.Hit.Path))
             {
                 score *= 0.7f;
             }
 
-            scored.Add((hit, score));
+            scored.Add(hit with { Score = score });
         }
 
         var ordered = scored
             .OrderByDescending(s => s.Score)
             .ThenByDescending(s => s.Hit.Score)
             .Take(desired)
-            .Select(s => s.Hit)
             .ToList();
 
         return ordered.Count > 0 ? ordered : hits.Take(desired).ToList();
@@ -293,6 +378,21 @@ static class ChatCommand
         if (text.Length <= maxChars) return text;
         return text[..maxChars] + "...";
     }
+
+    sealed class DocAggregate
+    {
+        public DocAggregate(RagRuntime.DocHit hit)
+        {
+            Hit = hit;
+            CompositeScore = hit.Score;
+        }
+
+        public RagRuntime.DocHit Hit { get; set; }
+        public float CompositeScore { get; set; }
+        public HashSet<string> NodeIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    readonly record struct RankedHit(RagRuntime.DocHit Hit, float Score, HashSet<string> NodeIds);
 
     static readonly string[] FrontendIndicators =
     {
