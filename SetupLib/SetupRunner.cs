@@ -46,7 +46,7 @@ public sealed class SetupRunner : IAsyncDisposable
         _models = Path.Combine(_root, "models");
         _modelsCurrent = Path.Combine(_models, "current");
         _modelsReleases = Path.Combine(_models, "releases");
-        _data = Path.Combine(_cur, "data");
+        _data = Path.Combine(_cur, "Data");
 
         var ts = DateTimeOffset.UtcNow.ToString("yyyyMMdd_HHmmss");
         var safeTag = _opts.ModelTag.Replace(':', '-');

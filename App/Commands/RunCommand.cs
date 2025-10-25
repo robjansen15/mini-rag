@@ -24,9 +24,10 @@ static class RunCommand
 
             Console.WriteLine("Loading corpus...");
             rag.LoadCorpus();
+            Console.WriteLine($"  Loaded {rag.Texts.Count} documents from {config.DataPath}");
 
             Console.WriteLine("Building index...");
-            rag.BuildIndex();
+            rag.BuildIndex(onStatus: msg => Console.WriteLine($"  {msg}"));
 
             Console.WriteLine($"Retrieving relevant documents for: {query}");
             var hits = rag.Retrieve(query, k: config.RetrievalTopK);

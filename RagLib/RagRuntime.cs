@@ -8,7 +8,7 @@ namespace RagLib;
 public sealed class RagOptions
 {
     public string BaseDir { get; init; } = AppContext.BaseDirectory;
-    public string DataPath { get; init; } = Path.Combine(AppContext.BaseDirectory, "data", "corpus.jsonl");
+    public string DataPath { get; init; } = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "current", "Data", "corpus.jsonl"));
     public string ModelTag { get; init; } = "llama3.2:1b-instruct-fp16";
     public string Host { get; init; } = "http://127.0.0.1:11434";
     public int NumPredict { get; init; } = int.TryParse(Environment.GetEnvironmentVariable("NUM_PREDICT"), out var n) ? n : 300;
@@ -51,7 +51,7 @@ public sealed class RagRuntime : IAsyncDisposable
         }
     }
 
-    public void BuildIndex(CancellationToken ct = default)
+    public void BuildIndex(CancellationToken ct = default, Action<string>? onStatus = null)
     {
         if (_texts.Count == 0) throw new InvalidOperationException("No texts loaded");
         _vocab.Clear();
@@ -62,6 +62,9 @@ public sealed class RagRuntime : IAsyncDisposable
         var docTermCounts = new List<Dictionary<int, int>>(_texts.Count);
         var dfCounts = new List<int>();
 
+        onStatus?.Invoke($"Indexing {_texts.Count} documents...");
+
+        var docCounter = 0;
         foreach (var text in _texts)
         {
             ct.ThrowIfCancellationRequested();
@@ -78,17 +81,24 @@ public sealed class RagRuntime : IAsyncDisposable
                 }
             }
             docTermCounts.Add(counts);
+            docCounter++;
+            if (docCounter % 100 == 0 || docCounter == _texts.Count)
+            {
+                onStatus?.Invoke($"Tokenized {docCounter}/{_texts.Count} documents");
+            }
         }
 
         var vocabSize = _vocab.Count;
         _idf = new float[vocabSize];
         var totalDocs = (float)_texts.Count;
+        onStatus?.Invoke($"Vocabulary size: {vocabSize} unique tokens");
         for (int i = 0; i < vocabSize; i++)
         {
             var dfv = dfCounts[i] == 0 ? 1 : dfCounts[i];
             _idf[i] = MathF.Log((totalDocs + 1f) / (dfv + 0.5f)) + 1f;
         }
 
+        onStatus?.Invoke("Building TF-IDF vectors...");
         foreach (var counts in docTermCounts)
         {
             if (counts.Count == 0)
@@ -113,6 +123,7 @@ public sealed class RagRuntime : IAsyncDisposable
         }
 
         _built = true;
+        onStatus?.Invoke("Index ready");
     }
 
     public IReadOnlyList<(int index, float score, string text)> Retrieve(string query, int k = 3, CancellationToken ct = default)

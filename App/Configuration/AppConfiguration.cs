@@ -11,9 +11,11 @@ public sealed class AppConfiguration
     public string OllamaHost { get; init; } = "http://127.0.0.1:11434";
     public string ModelTag { get; init; } = "llama3.2:1b-instruct-fp16";
 
+    public string ProjectRoot { get; init; }
+    public string CurrentPath { get; init; }
+    public string DataDirectory { get; init; }
     public string BaseDir { get; init; }
     public string DataPath { get; init; }
-    public string ProjectRoot { get; init; } = ".";
 
     public string CurrentLinkName { get; init; } = "llama1b";
     public int Threads { get; init; } = 16;
@@ -24,9 +26,11 @@ public sealed class AppConfiguration
     public AppConfiguration()
     {
         var projectRoot = LocateProjectRoot();
-        BaseDir = projectRoot;
-        DataPath = Path.Combine(projectRoot, "data", "corpus.jsonl");
         ProjectRoot = projectRoot;
+        CurrentPath = Path.Combine(projectRoot, "current");
+        DataDirectory = Path.Combine(CurrentPath, "Data");
+        BaseDir = projectRoot;
+        DataPath = Path.Combine(DataDirectory, "corpus.jsonl");
     }
 
     static string LocateProjectRoot()

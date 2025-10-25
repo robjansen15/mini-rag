@@ -17,7 +17,7 @@ namespace ExtractorLib;
 public sealed class ExtractOptions
 {
     public required string ProjectRoot { get; init; }
-    public string OutPath { get; init; } = Path.Combine("data", "corpus.jsonl");
+    public string OutPath { get; init; } = Path.Combine("current", "Data", "corpus.jsonl");
     public long MaxBytes { get; init; } = 3 * 1024 * 1024; // 3 MB default limit
     public bool Truncate { get; init; } = false;
     public int Threads { get; init; } = Environment.ProcessorCount;
@@ -39,12 +39,17 @@ public sealed class CodeExtractor
         var root = Path.GetFullPath(_opts.ProjectRoot);
         if (!Directory.Exists(root)) throw new DirectoryNotFoundException(root);
 
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(_opts.OutPath))!);
-        
+        var corpusPath = Path.GetFullPath(_opts.OutPath);
+        Console.WriteLine($"[extract] Project root: {root}");
+        Console.WriteLine($"[extract] Corpus file: {corpusPath}");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(corpusPath)!);
+
         // Load existing corpus to check for file hashes
+        Console.WriteLine("[extract] Loading existing corpus...");
         var existingEntries = LoadExistingCorpus();
-        Console.WriteLine($"Loaded {existingEntries.Count} existing entries from corpus");
-        
+        Console.WriteLine($"[extract] Loaded {existingEntries.Count} entries from {corpusPath}");
+
         // Always write tree manifest
         var tempTreePath = _opts.OutPath + ".tree.tmp";
         using (var init = new FileStream(tempTreePath, FileMode.Create, FileAccess.Write, FileShare.Read))
@@ -54,9 +59,10 @@ public sealed class CodeExtractor
             w.Flush();
         }
 
+        Console.WriteLine("[extract] Scanning filesystem for candidate files...");
         var dfsFiles = EnumerateFilesDFS(root).Where(FileRules.IsAllowedFile).ToList();
         var totalFiles = dfsFiles.Count;
-        Console.WriteLine($"Found {totalFiles} files to scan");
+        Console.WriteLine($"[extract] Found {totalFiles} files to check");
         
         // Calculate total size and filter files > MaxBytes
         var fileInfos = new List<(string path, long size)>();
@@ -68,13 +74,14 @@ public sealed class CodeExtractor
             try
             {
                 var fi = new FileInfo(file);
-                if (fi.Length > _opts.MaxBytes)
+                if (!_opts.Truncate && fi.Length > _opts.MaxBytes)
                 {
                     skippedTooLarge++;
                     continue;
                 }
-                fileInfos.Add((file, fi.Length));
-                totalBytes += fi.Length;
+                var effectiveSize = _opts.Truncate ? Math.Min(fi.Length, _opts.MaxBytes) : fi.Length;
+                fileInfos.Add((file, effectiveSize));
+                totalBytes += effectiveSize;
             }
             catch
             {
@@ -84,7 +91,7 @@ public sealed class CodeExtractor
         
         if (skippedTooLarge > 0)
         {
-            Console.WriteLine($"Skipped {skippedTooLarge} files larger than {_opts.MaxBytes / (1024 * 1024)} MB");
+            Console.WriteLine($"[extract] Skipped {skippedTooLarge} files larger than {_opts.MaxBytes / (1024 * 1024)} MB");
         }
         
         // Determine which files need processing based on hash
@@ -92,6 +99,7 @@ public sealed class CodeExtractor
         var skippedUnchanged = 0;
         long bytesToProcess = 0;
         
+        Console.WriteLine("[extract] Calculating hashes to detect changes...");
         foreach (var (file, size) in fileInfos)
         {
             ct.ThrowIfCancellationRequested();
@@ -110,12 +118,12 @@ public sealed class CodeExtractor
             }
         }
         
-        Console.WriteLine($"Files unchanged: {skippedUnchanged}, Files to process: {filesToProcess.Count}");
-        Console.WriteLine($"Total data to process: {FormatBytes(bytesToProcess)}");
-        
+        Console.WriteLine($"[extract] Files unchanged: {skippedUnchanged}, files to process: {filesToProcess.Count}");
+        Console.WriteLine($"[extract] Total data to process: {FormatBytes(bytesToProcess)}");
+
         if (filesToProcess.Count == 0 && skippedUnchanged == 0)
         {
-            Console.WriteLine("No files to process");
+            Console.WriteLine("[extract] No files to process");
             return;
         }
         
@@ -165,7 +173,7 @@ public sealed class CodeExtractor
             var estimatedSecondsRemaining = remainingBytes / Math.Max(bytesPerSecond, 1);
             var eta = TimeSpan.FromSeconds(estimatedSecondsRemaining);
             
-            Console.Write($"\rProgress: {processedCount}/{filesToProcess.Count} files ({percentage:F1}%) | " +
+            Console.Write($"\r[extract] Progress: {processedCount}/{filesToProcess.Count} files ({percentage:F1}%) | " +
                          $"{FormatBytes(processedBytes)}/{FormatBytes(bytesToProcess)} | " +
                          $"ETA: {FormatTimeSpan(eta)}      ");
 
@@ -185,6 +193,7 @@ public sealed class CodeExtractor
         
         try
         {
+            Console.WriteLine($"[extract] Writing merged corpus to {Path.GetFullPath(finalPath)}");
             using (var fs = new FileStream(finalPath, FileMode.Create, FileAccess.Write, FileShare.Read))
             using (var w = new StreamWriter(fs, new UTF8Encoding(false)))
             {
@@ -256,15 +265,15 @@ public sealed class CodeExtractor
             }
             
             var totalTime = DateTimeOffset.UtcNow - startTime;
-            Console.WriteLine($"Extraction complete! Processed {filesToProcess.Count} files, kept {skippedUnchanged} unchanged in {FormatTimeSpan(totalTime)}");
+            Console.WriteLine($"[extract] Complete. Processed {filesToProcess.Count} files, kept {skippedUnchanged} unchanged in {FormatTimeSpan(totalTime)}");
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Error writing corpus: {ex.Message}");
+            Console.Error.WriteLine($"[extract] Error writing corpus: {ex.Message}");
             if (File.Exists(backupPath))
             {
                 File.Copy(backupPath, finalPath, overwrite: true);
-                Console.WriteLine("Restored from backup");
+                Console.WriteLine("[extract] Restored from backup");
             }
             throw;
         }
