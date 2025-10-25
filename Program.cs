@@ -63,20 +63,12 @@ namespace ScriptRunner
 
     class Program
     {
-        private static string scriptDir;
-        private static string baseDir;
-        private static string currentDir;
         private static Config config;
 
         static async Task<int> Main(string[] args)
         {
             // Initialize configuration
             config = new Config();
-            
-            // Initialize paths
-            scriptDir = AppDomain.CurrentDomain.BaseDirectory;
-            baseDir = scriptDir;
-            currentDir = Path.Combine(baseDir, "current");
 
             if (args.Length == 0)
             {
@@ -118,43 +110,6 @@ namespace ScriptRunner
         private static void ShowUsage()
         {
             Console.WriteLine("usage: program {setup|run|chat|extract|clean|reset} [args]");
-        }
-
-        private static void EnsureCurrent()
-        {
-            // Create current directory if it doesn't exist
-            Directory.CreateDirectory(currentDir);
-
-            // Copy Python files to current directory
-            string[] filesToCopy = { "setup.py", "run.py", "chat.py", "extract.py" };
-            
-            foreach (string file in filesToCopy)
-            {
-                string sourcePath = Path.Combine(baseDir, file);
-                string destPath = Path.Combine(currentDir, file);
-                
-                if (File.Exists(sourcePath))
-                {
-                    File.Copy(sourcePath, destPath, overwrite: true);
-                    
-                    // Make file executable on Unix-like systems
-                    if (Environment.OSVersion.Platform == PlatformID.Unix || 
-                        Environment.OSVersion.Platform == PlatformID.MacOSX)
-                    {
-                        var chmod = new ProcessStartInfo
-                        {
-                            FileName = "chmod",
-                            Arguments = $"+x \"{destPath}\"",
-                            UseShellExecute = false,
-                            CreateNoWindow = true
-                        };
-                        using (var process = Process.Start(chmod))
-                        {
-                            process?.WaitForExit();
-                        }
-                    }
-                }
-            }
         }
 
         private static async Task<int> CmdSetup()
@@ -281,17 +236,14 @@ namespace ScriptRunner
 
         private static int CmdClean()
         {
-            if (Directory.Exists(currentDir))
-            {
-                Directory.Delete(currentDir, recursive: true);
-            }
-            Console.WriteLine($"cleaned: {currentDir}");
+            Console.WriteLine("Clean command is deprecated (legacy Python support removed)");
+            Console.WriteLine("To clean build artifacts, use: dotnet clean");
             return 0;
         }
 
         private static async Task<int> CmdReset()
         {
-            CmdClean();
+            Console.WriteLine("Running setup...");
             return await CmdSetup();
         }
     }

@@ -17,7 +17,7 @@ public sealed class ExtractOptions
 {
     public required string ProjectRoot { get; init; }
     public string OutPath { get; init; } = Path.Combine("data", "corpus.jsonl");
-    public long MaxBytes { get; init; } = 2 * 1024 * 1024;
+    public long MaxBytes { get; init; } = 3 * 1024 * 1024; // 3 MB default limit
     public bool Truncate { get; init; } = false;
     public int Threads { get; init; } = Environment.ProcessorCount;
 }
@@ -67,7 +67,14 @@ public sealed class CodeExtractor
         if (!Directory.Exists(root)) throw new DirectoryNotFoundException(root);
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(_opts.OutPath))!);
-        using (var init = new FileStream(_opts.OutPath, _opts.Truncate ? FileMode.Create : FileMode.Append, FileAccess.Write, FileShare.Read))
+        
+        // Load existing corpus to check for file hashes
+        var existingEntries = LoadExistingCorpus();
+        Console.WriteLine($"Loaded {existingEntries.Count} existing entries from corpus");
+        
+        // Always write tree manifest
+        var tempTreePath = _opts.OutPath + ".tree.tmp";
+        using (var init = new FileStream(tempTreePath, FileMode.Create, FileAccess.Write, FileShare.Read))
         using (var w = new StreamWriter(init, new UTF8Encoding(false)))
         {
             WriteTreeManifest(w, root);
@@ -76,58 +83,306 @@ public sealed class CodeExtractor
 
         var dfsFiles = EnumerateFilesDFS(root).Where(IsAllowedFile).ToList();
         var totalFiles = dfsFiles.Count;
-        Console.WriteLine($"Found {totalFiles} files to process");
+        Console.WriteLine($"Found {totalFiles} files to scan");
         
-        var index = new ConcurrentDictionary<string,int>(StringComparer.Ordinal);
-        var processedCount = 0;
-        var i = 0;
-
-        while (i < dfsFiles.Count)
+        // Calculate total size and filter files > MaxBytes
+        var fileInfos = new List<(string path, long size)>();
+        var skippedTooLarge = 0;
+        long totalBytes = 0;
+        
+        foreach (var file in dfsFiles)
+        {
+            try
+            {
+                var fi = new FileInfo(file);
+                if (fi.Length > _opts.MaxBytes)
+                {
+                    skippedTooLarge++;
+                    continue;
+                }
+                fileInfos.Add((file, fi.Length));
+                totalBytes += fi.Length;
+            }
+            catch
+            {
+                // Skip files we can't access
+            }
+        }
+        
+        if (skippedTooLarge > 0)
+        {
+            Console.WriteLine($"Skipped {skippedTooLarge} files larger than {_opts.MaxBytes / (1024 * 1024)} MB");
+        }
+        
+        // Determine which files need processing based on hash
+        var filesToProcess = new List<(string path, long size)>();
+        var skippedUnchanged = 0;
+        long bytesToProcess = 0;
+        
+        foreach (var (file, size) in fileInfos)
         {
             ct.ThrowIfCancellationRequested();
-            var round = dfsFiles.Skip(i).Take(_scanThreads).ToList();
-            var results = new (int order, string line) [round.Count];
+            var fileHash = ComputeFileHash(file);
+            var rel = Path.GetRelativePath(root, file);
+            var fileId = BuildIdForFile(rel);
+            
+            if (existingEntries.TryGetValue(fileId, out var existing) && existing.hash == fileHash)
+            {
+                skippedUnchanged++;
+            }
+            else
+            {
+                filesToProcess.Add((file, size));
+                bytesToProcess += size;
+            }
+        }
+        
+        Console.WriteLine($"Files unchanged: {skippedUnchanged}, Files to process: {filesToProcess.Count}");
+        Console.WriteLine($"Total data to process: {FormatBytes(bytesToProcess)}");
+        
+        if (filesToProcess.Count == 0 && skippedUnchanged == 0)
+        {
+            Console.WriteLine("No files to process");
+            return;
+        }
+        
+        // Process changed files with progress tracking
+        var newEntries = new ConcurrentDictionary<string, List<string>>(StringComparer.Ordinal);
+        var processedCount = 0;
+        long processedBytes = 0;
+        var startTime = DateTimeOffset.UtcNow;
+        var i = 0;
+
+        while (i < filesToProcess.Count)
+        {
+            ct.ThrowIfCancellationRequested();
+            var round = filesToProcess.Skip(i).Take(_scanThreads).ToList();
 
             Parallel.ForEach(
-                source: round.Select((path, order) => (path, order)),
+                source: round,
                 new ParallelOptions { MaxDegreeOfParallelism = _scanThreads, CancellationToken = ct },
-                tuple =>
+                item =>
                 {
-                    var (path, order) = tuple;
-                    var owner = Thread.CurrentThread.ManagedThreadId;
-                    if (!index.TryAdd(path, owner)) return;
+                    var (path, size) = item;
                     try
                     {
-                        var entryLines = ProcessFile(root, path);
-                        var sb = new StringBuilder();
-                        foreach (var line in entryLines) sb.AppendLine(line);
-                        results[order] = (order, sb.ToString());
+                        var entryLines = ProcessFile(root, path).ToList();
+                        if (entryLines.Count > 0)
+                        {
+                            newEntries[path] = entryLines;
+                        }
                     }
-                    finally
+                    catch (Exception ex)
                     {
-                        index.TryRemove(path, out _);
+                        Console.Error.WriteLine($"Error processing {path}: {ex.Message}");
                     }
                 });
 
-            using (var fs = new FileStream(_opts.OutPath, FileMode.Append, FileAccess.Write, FileShare.Read))
-            using (var w = new StreamWriter(fs, new UTF8Encoding(false)))
+            // Update progress
+            foreach (var (path, size) in round)
             {
-                foreach (var r in results.OrderBy(r => r.order))
-                {
-                    if (!string.IsNullOrEmpty(r.line)) w.Write(r.line);
-                }
+                processedBytes += size;
             }
-
             processedCount += round.Count;
-            var percentage = (processedCount * 100.0) / totalFiles;
-            Console.Write($"\rProgress: {processedCount}/{totalFiles} files ({percentage:F1}%)");
+            
+            var percentage = (processedCount * 100.0) / filesToProcess.Count;
+            var elapsed = DateTimeOffset.UtcNow - startTime;
+            var bytesPerSecond = processedBytes / elapsed.TotalSeconds;
+            var remainingBytes = bytesToProcess - processedBytes;
+            var estimatedSecondsRemaining = remainingBytes / Math.Max(bytesPerSecond, 1);
+            var eta = TimeSpan.FromSeconds(estimatedSecondsRemaining);
+            
+            Console.Write($"\rProgress: {processedCount}/{filesToProcess.Count} files ({percentage:F1}%) | " +
+                         $"{FormatBytes(processedBytes)}/{FormatBytes(bytesToProcess)} | " +
+                         $"ETA: {FormatTimeSpan(eta)}      ");
 
-            Array.Clear(results, 0, results.Length);
             i += round.Count;
         }
         
-        Console.WriteLine(); // New line after progress is complete
-        Console.WriteLine("Extraction complete!");
+        Console.WriteLine();
+        
+        // Merge: write tree, then existing (unchanged) entries, then new entries
+        var finalPath = _opts.OutPath;
+        var backupPath = _opts.OutPath + ".backup";
+        
+        if (File.Exists(finalPath))
+        {
+            File.Copy(finalPath, backupPath, overwrite: true);
+        }
+        
+        try
+        {
+            using (var fs = new FileStream(finalPath, FileMode.Create, FileAccess.Write, FileShare.Read))
+            using (var w = new StreamWriter(fs, new UTF8Encoding(false)))
+            {
+                // Write tree manifest
+                var treeContent = File.ReadAllText(tempTreePath);
+                w.Write(treeContent);
+                
+                // Get all file IDs that were processed
+                var processedFileIds = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var (file, _) in filesToProcess)
+                {
+                    var rel = Path.GetRelativePath(root, file);
+                    var fileId = BuildIdForFile(rel);
+                    processedFileIds.Add(fileId);
+                }
+                
+                // Write unchanged entries from existing corpus
+                foreach (var kvp in existingEntries)
+                {
+                    var entryId = kvp.Key;
+                    var entry = kvp.Value;
+                    
+                    var isFileEntry = entryId.EndsWith(".file");
+                    var isClassEntry = entryId.EndsWith(".class");
+                    var isFunctionEntry = !isFileEntry && !isClassEntry && entryId != "__TREE__";
+                    
+                    if (isFileEntry && processedFileIds.Contains(entryId))
+                    {
+                        continue;
+                    }
+                    
+                    if (isClassEntry || isFunctionEntry)
+                    {
+                        var belongsToReprocessedFile = false;
+                        foreach (var fileId in processedFileIds)
+                        {
+                            var filePrefix = fileId.Substring(0, fileId.Length - 5);
+                            if (entryId.StartsWith(filePrefix + "."))
+                            {
+                                belongsToReprocessedFile = true;
+                                break;
+                            }
+                        }
+                        
+                        if (belongsToReprocessedFile)
+                        {
+                            continue;
+                        }
+                    }
+                    
+                    w.WriteLine(entry.json);
+                }
+                
+                // Write new/updated entries
+                foreach (var kvp in newEntries.OrderBy(k => k.Key))
+                {
+                    foreach (var line in kvp.Value)
+                    {
+                        w.WriteLine(line);
+                    }
+                }
+            }
+            
+            // Clean up
+            File.Delete(tempTreePath);
+            if (File.Exists(backupPath))
+            {
+                File.Delete(backupPath);
+            }
+            
+            var totalTime = DateTimeOffset.UtcNow - startTime;
+            Console.WriteLine($"Extraction complete! Processed {filesToProcess.Count} files, kept {skippedUnchanged} unchanged in {FormatTimeSpan(totalTime)}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error writing corpus: {ex.Message}");
+            if (File.Exists(backupPath))
+            {
+                File.Copy(backupPath, finalPath, overwrite: true);
+                Console.WriteLine("Restored from backup");
+            }
+            throw;
+        }
+    }
+    
+    static string FormatBytes(long bytes)
+    {
+        string[] sizes = { "B", "KB", "MB", "GB" };
+        double len = bytes;
+        int order = 0;
+        while (len >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            len = len / 1024;
+        }
+        return $"{len:0.##} {sizes[order]}";
+    }
+    
+    static string FormatTimeSpan(TimeSpan ts)
+    {
+        if (ts.TotalSeconds < 60)
+            return $"{ts.TotalSeconds:F0}s";
+        if (ts.TotalMinutes < 60)
+            return $"{ts.TotalMinutes:F1}m";
+        return $"{ts.TotalHours:F1}h";
+    }
+    
+    Dictionary<string, (string hash, string json)> LoadExistingCorpus()
+    {
+        var entries = new Dictionary<string, (string hash, string json)>(StringComparer.Ordinal);
+        
+        if (!File.Exists(_opts.OutPath))
+        {
+            return entries;
+        }
+        
+        try
+        {
+            using var fs = File.OpenRead(_opts.OutPath);
+            using var sr = new StreamReader(fs, new UTF8Encoding(false));
+            string? line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (line.Length == 0) continue;
+                
+                try
+                {
+                    using var jd = JsonDocument.Parse(line);
+                    var root = jd.RootElement;
+                    
+                    if (!root.TryGetProperty("id", out var idProp)) continue;
+                    if (!root.TryGetProperty("hash", out var hashProp)) continue;
+                    
+                    var id = idProp.GetString();
+                    var hash = hashProp.GetString();
+                    
+                    if (id != null && hash != null)
+                    {
+                        entries[id] = (hash, line);
+                    }
+                }
+                catch
+                {
+                    // Skip malformed entries
+                }
+            }
+        }
+        catch
+        {
+            // If we can't read the corpus, just return empty
+        }
+        
+        return entries;
+    }
+    
+    static string ComputeFileHash(string filePath)
+    {
+        try
+        {
+            using var sha = SHA256.Create();
+            using var fs = File.OpenRead(filePath);
+            var hash = sha.ComputeHash(fs);
+            var sb = new StringBuilder(hash.Length * 2);
+            foreach (var b in hash) sb.Append(b.ToString("x2"));
+            return sb.ToString();
+        }
+        catch
+        {
+            // If we can't read the file, return empty hash so it gets processed
+            return "";
+        }
     }
 
     static IEnumerable<string> EnumerateFilesDFS(string root)
@@ -200,284 +455,56 @@ public sealed class CodeExtractor
         {
             id = BuildIdForFile(rel),
             type = "file",
-            title = HeuristicFileTitle(rel, lang, text.Value.Content),
+            title = ExtractionTools.HeuristicFileTitle(rel, lang, text.Value.Content),
             path = rel.Replace('\\','/'),
             abs_path = abs,
             root = root,
             lang = lang,
             size = text.Value.Size,
-            hash = Sha256(text.Value.Content),
+            hash = ExtractionTools.Sha256(text.Value.Content),
             text = contentWithCtx
         };
         yield return JsonSerializer.Serialize(fileObj);
 
-        foreach (var fn in ExtractFunctions(rel, lang, text.Value.Content))
+        // Extract classes (for object-oriented languages)
+        foreach (var cls in ExtractionTools.ExtractClasses(rel, lang, text.Value.Content))
+        {
+            var clsObj = new JsonObj
+            {
+                id = BuildIdForClass(rel, cls.name),
+                type = "class",
+                title = ExtractionTools.HeuristicClassTitle(cls.name, rel, lang, cls.body),
+                class_name = cls.name,
+                path = rel.Replace('\\','/'),
+                abs_path = abs,
+                root = root,
+                lang = lang,
+                size = cls.body.Length,
+                hash = ExtractionTools.Sha256(cls.body),
+                text = BuildTextWithContext(root, rel, abs, lang, cls.body)
+            };
+            yield return JsonSerializer.Serialize(clsObj);
+        }
+
+        // Extract functions/methods
+        foreach (var fn in ExtractionTools.ExtractFunctions(rel, lang, text.Value.Content))
         {
             var fnObj = new JsonObj
             {
                 id = BuildIdForFunction(rel, fn.name),
                 type = "function",
-                title = HeuristicFunctionTitle(fn.name, rel, lang, fn.body),
+                title = ExtractionTools.HeuristicFunctionTitle(fn.name, rel, lang, fn.body),
                 function = fn.name,
                 path = rel.Replace('\\','/'),
                 abs_path = abs,
                 root = root,
                 lang = lang,
                 size = fn.body.Length,
-                hash = Sha256(fn.body),
+                hash = ExtractionTools.Sha256(fn.body),
                 text = BuildTextWithContext(root, rel, abs, lang, fn.body)
             };
             yield return JsonSerializer.Serialize(fnObj);
         }
-    }
-
-    static IEnumerable<(string name, string body)> ExtractFunctions(string rel, string lang, string content)
-    {
-        // Simple pattern matching for common function definitions
-        // This is a heuristic approach - can be enhanced with proper parsing
-        
-        var patterns = new Dictionary<string, string>
-        {
-            // C#, Java, C, C++, JavaScript, TypeScript
-            ["cs"] = @"(?:public|private|protected|internal|static|\s)+(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
-            ["java"] = @"(?:public|private|protected|static|\s)+(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
-            ["c"] = @"(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
-            ["cpp"] = @"(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
-            ["js"] = @"(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:function|\([^)]*\)\s*=>))",
-            ["ts"] = @"(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:function|\([^)]*\)\s*=>))",
-            ["jsx"] = @"(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:function|\([^)]*\)\s*=>))",
-            ["tsx"] = @"(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:function|\([^)]*\)\s*=>))",
-            
-            // Python
-            ["py"] = @"def\s+(\w+)\s*\([^)]*\)\s*:",
-            
-            // Go
-            ["go"] = @"func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\([^)]*\)",
-            
-            // Rust
-            ["rs"] = @"fn\s+(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)",
-            
-            // PHP
-            ["php"] = @"function\s+(\w+)\s*\([^)]*\)",
-            
-            // Ruby
-            ["rb"] = @"def\s+(\w+)",
-            
-            // Swift
-            ["swift"] = @"func\s+(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)",
-        };
-
-        if (!patterns.TryGetValue(lang, out var pattern))
-            yield break;
-
-        var regex = new Regex(pattern, RegexOptions.Multiline);
-        var matches = regex.Matches(content);
-
-        foreach (Match match in matches)
-        {
-            var functionName = match.Groups[1].Success ? match.Groups[1].Value : 
-                              match.Groups[2].Success ? match.Groups[2].Value : null;
-            
-            if (string.IsNullOrWhiteSpace(functionName))
-                continue;
-
-            // Extract function body - simple approach: find matching braces or end of block
-            var startIndex = match.Index;
-            var endIndex = FindFunctionEnd(content, startIndex, lang);
-            
-            if (endIndex > startIndex)
-            {
-                var body = content.Substring(startIndex, endIndex - startIndex);
-                if (body.Length > 10 && body.Length < 50000) // Skip very small or very large functions
-                {
-                    yield return (functionName, body);
-                }
-            }
-        }
-    }
-
-    static int FindFunctionEnd(string content, int startIndex, string lang)
-    {
-        // For brace-based languages, find matching closing brace
-        if (new[] { "cs", "java", "c", "cpp", "js", "ts", "jsx", "tsx", "go", "rs", "php", "swift" }.Contains(lang))
-        {
-            var braceCount = 0;
-            var foundOpenBrace = false;
-            
-            for (int i = startIndex; i < content.Length; i++)
-            {
-                if (content[i] == '{')
-                {
-                    braceCount++;
-                    foundOpenBrace = true;
-                }
-                else if (content[i] == '}')
-                {
-                    braceCount--;
-                    if (foundOpenBrace && braceCount == 0)
-                    {
-                        return i + 1;
-                    }
-                }
-            }
-        }
-        // For Python/Ruby, find next function definition or end of indentation
-        else if (lang == "py" || lang == "rb")
-        {
-            var lines = content.Substring(startIndex).Split('\n');
-            if (lines.Length == 0) return startIndex + 100;
-            
-            var firstLine = lines[0];
-            var baseIndent = firstLine.Length - firstLine.TrimStart().Length;
-            
-            var bodyLength = firstLine.Length;
-            for (int i = 1; i < lines.Length; i++)
-            {
-                var line = lines[i];
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    bodyLength += line.Length + 1;
-                    continue;
-                }
-                
-                var indent = line.Length - line.TrimStart().Length;
-                if (indent <= baseIndent && line.TrimStart().StartsWith("def "))
-                {
-                    break;
-                }
-                
-                bodyLength += line.Length + 1;
-                
-                if (bodyLength > 10000) break; // Limit function size
-            }
-            
-            return Math.Min(startIndex + bodyLength, content.Length);
-        }
-        
-        // Default: take next 500 characters
-        return Math.Min(startIndex + 500, content.Length);
-    }
-
-    static bool IsAllowedFile(string file)
-    {
-        var name = Path.GetFileName(file);
-        if (SpecialBasenames.ContainsKey(name)) return true;
-        return AllowedExts.Contains(Path.GetExtension(file));
-    }
-
-    static string DetectLang(string file)
-    {
-        var name = Path.GetFileName(file);
-        if (SpecialBasenames.TryGetValue(name, out var tag)) return tag;
-        var ext = Path.GetExtension(file);
-        if (string.IsNullOrEmpty(ext)) return "plain";
-        return ext.TrimStart('.').ToLowerInvariant();
-    }
-
-    static (string Content, int Size)? ReadTextFile(string file, long maxBytes)
-    {
-        try
-        {
-            var fi = new FileInfo(file);
-            if (!fi.Exists) return null;
-            if (fi.Length > maxBytes)
-            {
-                using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read);
-                var buf = new byte[maxBytes];
-                var read = fs.Read(buf, 0, (int)maxBytes);
-                return (Encoding.UTF8.GetString(buf, 0, read), (int)maxBytes);
-            }
-            try { return (File.ReadAllText(file, new UTF8Encoding(false, true)), (int)fi.Length); } catch {}
-            try { return (File.ReadAllText(file, new UnicodeEncoding(false, true, true)), (int)fi.Length); } catch {}
-            try { return (File.ReadAllText(file, Encoding.Latin1), (int)fi.Length); } catch {}
-            var b = File.ReadAllBytes(file);
-            return (Encoding.UTF8.GetString(b), b.Length);
-        }
-        catch { return null; }
-    }
-
-    static string BuildTextWithContext(string root, string rel, string abs, string lang, string content)
-    {
-        var sb = new StringBuilder();
-        sb.Append("PATH: ").Append(rel).Append('\n');
-        sb.Append("ABS_PATH: ").Append(abs).Append('\n');
-        sb.Append("ROOT: ").Append(root).Append('\n');
-        sb.Append("LANG: ").Append(lang).Append('\n');
-        sb.Append("---\n");
-        sb.Append(content);
-        return sb.ToString();
-    }
-
-    static string Sha256(string s)
-    {
-        using var sha = SHA256.Create();
-        var bytes = Encoding.UTF8.GetBytes(s);
-        var hash = sha.ComputeHash(bytes);
-        var sb = new StringBuilder(hash.Length * 2);
-        foreach (var b in hash) sb.Append(b.ToString("x2"));
-        return sb.ToString();
-    }
-
-    static string BuildIdForFile(string rel)
-    {
-        var parts = rel.Replace('\\','/').Split('/', StringSplitOptions.RemoveEmptyEntries).ToList();
-        if (parts.Count == 0) parts.Add(rel);
-        var file = parts.Last();
-        var fileNoExt = Path.GetFileNameWithoutExtension(file);
-        parts[^1] = fileNoExt;
-        return string.Join('.', parts) + ".file";
-    }
-
-    static string BuildIdForFunction(string rel, string fn)
-    {
-        var parts = rel.Replace('\\','/').Split('/', StringSplitOptions.RemoveEmptyEntries).ToList();
-        if (parts.Count == 0) parts.Add(rel);
-        var file = parts.Last();
-        var fileNoExt = Path.GetFileNameWithoutExtension(file);
-        parts[^1] = fileNoExt;
-        return string.Join('.', parts) + "." + SanitizeToken(fn);
-    }
-
-    static string SanitizeToken(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return "unknown";
-        var t = new string(s.Select(ch => char.IsLetterOrDigit(ch) ? ch : '_').ToArray());
-        t = Regex.Replace(t, "_{2,}", "_");
-        return t.Trim('_');
-    }
-
-    static string HeuristicFileTitle(string rel, string lang, string content)
-    {
-        var tokens = new List<string> { Path.GetFileName(rel), lang };
-        var hints = ExtractTopNIdentifiers(content, 5);
-        if (hints.Count > 0) tokens.Add(string.Join("/", hints));
-        return string.Join(" • ", tokens);
-    }
-
-    static string HeuristicFunctionTitle(string fn, string rel, string lang, string body)
-    {
-        var verbs = Regex.Match(body, @"\b(get|set|build|create|update|delete|fetch|render|compute|calculate|process|handle|validate)\b", RegexOptions.IgnoreCase);
-        var hint = verbs.Success ? verbs.Value.ToLowerInvariant() : "function";
-        return $"{fn} — {hint} ({Path.GetFileName(rel)} {lang})";
-    }
-
-    static List<string> ExtractTopNIdentifiers(string content, int n)
-    {
-        var rx = new Regex(@"\b([A-Za-z_][A-Za-z0-9_]{3,})\b");
-        var freq = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (Match m in rx.Matches(content))
-        {
-            var t = m.Groups[1].Value;
-            if (IsNoise(t)) continue;
-            freq[t] = freq.TryGetValue(t, out var c) ? c + 1 : 1;
-        }
-        return freq.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key).Take(n).Select(kv => kv.Key).ToList();
-    }
-
-    static bool IsNoise(string t)
-    {
-        var k = t.ToLowerInvariant();
-        return k is "the" or "and" or "else" or "null" or "true" or "false" or "class" or "public" or "private" or "protected" or "static" or "void" or "int" or "string" or "return" or "if" or "for" or "while" or "this" or "var" or "let" or "const" or "function";
     }
 
     sealed class JsonObj
@@ -485,6 +512,7 @@ public sealed class CodeExtractor
         public string id { get; set; } = "";
         public string type { get; set; } = "";
         public string? title { get; set; }
+        public string? class_name { get; set; }
         public string? function { get; set; }
         public string path { get; set; } = "";
         public string abs_path { get; set; } = "";
