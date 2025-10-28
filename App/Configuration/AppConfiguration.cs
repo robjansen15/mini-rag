@@ -19,9 +19,9 @@ public sealed class AppConfiguration
     public string SemanticSummaryPath { get; init; }
 
     public string CurrentLinkName { get; init; } = "llama1b";
-    public int Threads { get; init; } = 16;
+    public int Threads { get; init; } = 64;
     public int NumPredict { get; init; } = 300;
-    public int RetrievalTopK { get; init; } = 5;
+    public int RetrievalTopK { get; init; } = 6;
     public bool TruncateOutput { get; init; } = true;
 
     public AppConfiguration()

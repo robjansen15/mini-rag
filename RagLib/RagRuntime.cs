@@ -1,4 +1,5 @@
 // RagRuntime.cs
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -7,12 +8,25 @@ namespace RagLib;
 
 public sealed class RagOptions
 {
-    public string BaseDir { get; init; } = AppContext.BaseDirectory;
-    public string DataPath { get; init; } = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "current", "Data", "corpus.jsonl"));
-    public string ModelTag { get; init; } = "llama3.2:1b-instruct-fp16";
-    public string Host { get; init; } = "http://127.0.0.1:11434";
-    public int NumPredict { get; init; } = int.TryParse(Environment.GetEnvironmentVariable("NUM_PREDICT"), out var n) ? n : 300;
-    public int IndexThreads { get; init; } = Math.Max(1, Environment.ProcessorCount);
+    public string BaseDir { get; init; }
+    public string DataPath { get; init; }
+    public string IndexCachePath { get; init; }
+    public string ModelTag { get; init; }
+    public string Host { get; init; }
+    public int NumPredict { get; init; }
+    public int IndexThreads { get; init; }
+
+    public RagOptions()
+    {
+        BaseDir = AppContext.BaseDirectory;
+        var defaultDataPath = Path.GetFullPath(Path.Combine(BaseDir, "..", "..", "..", "current", "Data", "corpus.jsonl"));
+        DataPath = defaultDataPath;
+        IndexCachePath = Path.ChangeExtension(defaultDataPath, ".tfidf.bin") ?? defaultDataPath + ".tfidf.bin";
+        ModelTag = "llama3.2:1b-instruct-fp16";
+        Host = "http://127.0.0.1:11434";
+        NumPredict = int.TryParse(Environment.GetEnvironmentVariable("NUM_PREDICT"), out var n) ? n : 300;
+        IndexThreads = Math.Max(1, Environment.ProcessorCount);
+    }
 }
 
 public sealed class RagRuntime : IAsyncDisposable
@@ -25,6 +39,7 @@ public sealed class RagRuntime : IAsyncDisposable
     readonly Dictionary<string, int> _vocab = new(StringComparer.OrdinalIgnoreCase);
     float[]? _idf;
     bool _built;
+    const int CacheFormatVersion = 1;
 
     public RagRuntime(RagOptions opts)
     {
@@ -59,6 +74,13 @@ public sealed class RagRuntime : IAsyncDisposable
     public void BuildIndex(CancellationToken ct = default, Action<string>? onStatus = null)
     {
         if (_texts.Count == 0) throw new InvalidOperationException("No texts loaded");
+        var fingerprint = ComputeCorpusFingerprint(_texts, _paths);
+        if (TryLoadIndexFromCache(fingerprint, ct, onStatus))
+        {
+            _built = true;
+            return;
+        }
+
         _vocab.Clear();
         _docVecs.Clear();
         _idf = null;
@@ -129,6 +151,7 @@ public sealed class RagRuntime : IAsyncDisposable
 
         _built = true;
         onStatus?.Invoke("Index ready");
+        SaveIndexToCache(fingerprint, ct, onStatus);
     }
 
     public IReadOnlyList<DocHit> Retrieve(string query, int k = 3, CancellationToken ct = default)
@@ -276,6 +299,151 @@ public sealed class RagRuntime : IAsyncDisposable
         {
             yield return sb.ToString();
         }
+    }
+
+    bool TryLoadIndexFromCache(string fingerprint, CancellationToken ct, Action<string>? onStatus)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_opts.IndexCachePath)) return false;
+            if (!File.Exists(_opts.IndexCachePath)) return false;
+
+            using var fs = new FileStream(_opts.IndexCachePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var br = new BinaryReader(fs, Encoding.UTF8, leaveOpen: false);
+
+            var version = br.ReadInt32();
+            if (version != CacheFormatVersion) return false;
+
+            var storedFingerprint = br.ReadString();
+            if (!string.Equals(storedFingerprint, fingerprint, StringComparison.Ordinal)) return false;
+
+            var docCount = br.ReadInt32();
+            if (docCount != _texts.Count) return false;
+
+            var vocabCount = br.ReadInt32();
+            if (vocabCount < 0) return false;
+            var vocabList = new string[vocabCount];
+            for (int i = 0; i < vocabCount; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                vocabList[i] = br.ReadString();
+            }
+
+            var idfCount = br.ReadInt32();
+            if (idfCount != vocabCount) return false;
+            var idf = new float[idfCount];
+            for (int i = 0; i < idfCount; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                idf[i] = br.ReadSingle();
+            }
+
+            var docVecs = new List<SparseVec>(docCount);
+            for (int doc = 0; doc < docCount; doc++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var idxLen = br.ReadInt32();
+                if (idxLen < 0) return false;
+                var idx = new int[idxLen];
+                for (int j = 0; j < idxLen; j++) idx[j] = br.ReadInt32();
+
+                var valLen = br.ReadInt32();
+                if (valLen != idxLen) return false;
+                var vals = new float[valLen];
+                for (int j = 0; j < valLen; j++) vals[j] = br.ReadSingle();
+
+                var norm = br.ReadSingle();
+                docVecs.Add(new SparseVec(idx, vals, norm));
+            }
+
+            _vocab.Clear();
+            for (int i = 0; i < vocabList.Length; i++)
+            {
+                _vocab[vocabList[i]] = i;
+            }
+
+            _docVecs.Clear();
+            _docVecs.AddRange(docVecs);
+            _idf = idf;
+            onStatus?.Invoke("Loaded cached TF-IDF index");
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    void SaveIndexToCache(string fingerprint, CancellationToken ct, Action<string>? onStatus)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_opts.IndexCachePath)) return;
+            var dir = Path.GetDirectoryName(_opts.IndexCachePath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+            using var fs = new FileStream(_opts.IndexCachePath, FileMode.Create, FileAccess.Write, FileShare.None);
+            using var bw = new BinaryWriter(fs, Encoding.UTF8, leaveOpen: false);
+
+            bw.Write(CacheFormatVersion);
+            bw.Write(fingerprint);
+            bw.Write(_docVecs.Count);
+
+            var vocabList = new string[_vocab.Count];
+            foreach (var kvp in _vocab)
+            {
+                vocabList[kvp.Value] = kvp.Key;
+            }
+
+            bw.Write(vocabList.Length);
+            for (int i = 0; i < vocabList.Length; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                bw.Write(vocabList[i]);
+            }
+
+            var idf = _idf ?? Array.Empty<float>();
+            bw.Write(idf.Length);
+            for (int i = 0; i < idf.Length; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                bw.Write(idf[i]);
+            }
+
+            foreach (var vec in _docVecs)
+            {
+                ct.ThrowIfCancellationRequested();
+                bw.Write(vec.Idx.Length);
+                foreach (var idx in vec.Idx) bw.Write(idx);
+                bw.Write(vec.Val.Length);
+                foreach (var val in vec.Val) bw.Write(val);
+                bw.Write(vec.Norm);
+            }
+
+            onStatus?.Invoke("Saved TF-IDF index cache");
+        }
+        catch
+        {
+            // Cache persistence failures are non-fatal.
+        }
+    }
+
+    static string ComputeCorpusFingerprint(IReadOnlyList<string> texts, IReadOnlyList<string> paths)
+    {
+        using var sha = SHA256.Create();
+        var newline = new byte[] { (byte)'\n' };
+        for (int i = 0; i < texts.Count; i++)
+        {
+            var pathBytes = Encoding.UTF8.GetBytes(paths[i] ?? string.Empty);
+            sha.TransformBlock(pathBytes, 0, pathBytes.Length, null, 0);
+            sha.TransformBlock(newline, 0, newline.Length, null, 0);
+            var textBytes = Encoding.UTF8.GetBytes(texts[i] ?? string.Empty);
+            sha.TransformBlock(textBytes, 0, textBytes.Length, null, 0);
+            sha.TransformBlock(newline, 0, newline.Length, null, 0);
+        }
+
+        sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+        return Convert.ToHexString(sha.Hash ?? Array.Empty<byte>());
     }
 
     public ValueTask DisposeAsync()

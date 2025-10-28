@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using RagLib;
@@ -16,6 +17,7 @@ static class RunCommand
             var rag = new RagRuntime(new RagOptions
             {
                 DataPath = config.DataPath,
+                IndexCachePath = Path.ChangeExtension(config.DataPath, ".tfidf.bin"),
                 ModelTag = config.ModelTag,
                 Host = config.OllamaHost,
                 NumPredict = config.NumPredict,
